@@ -23,10 +23,12 @@ model_app = typer.Typer(no_args_is_help=True, help="Manage models (base model + 
 config_app = typer.Typer(no_args_is_help=True, help="Manage settings configs for a model")
 runs_app = typer.Typer(no_args_is_help=True, help="Inspect local runs")
 hosted_app = typer.Typer(no_args_is_help=True, help="Control the always-on hosted model")
+gpu_app = typer.Typer(no_args_is_help=True, help="Run commands with the GPU to themselves")
 app.add_typer(model_app, name="model")
 app.add_typer(config_app, name="config")
 app.add_typer(runs_app, name="runs")
 app.add_typer(hosted_app, name="hosted")
+app.add_typer(gpu_app, name="gpu")
 
 HOSTED_PORT = 8080
 SERVE_PORT = 8081
@@ -53,6 +55,39 @@ def _check_power() -> None:
 @app.callback()
 def _startup() -> None:
     hosted.recover_paused_hosted()
+
+
+# -- gpu ---------------------------------------------------------------------
+@gpu_app.command("run", context_settings={"allow_extra_args": True, "ignore_unknown_options": True})
+def gpu_run(
+    ctx: typer.Context,
+    label: str = typer.Option("manual", help="What the site names while chat is paused, e.g. qwen-serving/probe"),
+    wait: bool = typer.Option(False, help="Queue behind a held GPU lock instead of failing"),
+) -> None:
+    """Run a command with the GPU to itself: chat pauses, the command runs in its own process group, chat resumes.
+
+    Usage: lab gpu run --label x/y -- COMMAND ARGS... Ctrl-C or SIGTERM stops the command's whole group.
+    """
+    import signal
+
+    from lab.engines.process import ServerProcess
+
+    if not ctx.args:
+        _fail("usage: lab gpu run [--label x/y] -- <command> [args...]")
+    _check_power()
+
+    def _interrupt(signum, frame):
+        raise KeyboardInterrupt
+
+    signal.signal(signal.SIGTERM, _interrupt)
+    rc = 130
+    with hosted.exclusive_gpu(f"serve {label}", wait=wait, cool=False):
+        server = ServerProcess(list(ctx.args))
+        try:
+            rc = server.wait()
+        except KeyboardInterrupt:
+            server.stop()
+    raise typer.Exit(rc)
 
 
 # -- doctor ------------------------------------------------------------------
