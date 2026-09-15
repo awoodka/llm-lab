@@ -1,7 +1,9 @@
 // Mirror of lab/src/lab/schema.py (RunBundle). Bump SCHEMA_VERSION on both sides together.
 import { z } from 'zod';
 
-export const SCHEMA_VERSION = 1;
+export const SCHEMA_VERSION = 2;
+/** v1 lab versions publish speed runs; evals runs must be v2. */
+export const ACCEPTED_SCHEMA_VERSIONS = [1, 2] as const;
 
 const num = z.number();
 const optNum = z.number().nullish();
@@ -21,7 +23,7 @@ export const ModelInfo = z.object({
   slug: z.string(),
   name: z.string(),
   base: z.string(),
-  engine: z.enum(['llama.cpp', 'exllamav3']),
+  engine: z.enum(['llama.cpp', 'exllamav3', 'vllm']),
   format: z.string(),
   quant: z.string(),
   bpw: optNum,
@@ -91,12 +93,20 @@ export const EvalResult = z.object({
   task: z.string(),
   metric: z.string(),
   filter: z.string().default('none'),
+  /** Fraction (0-1); the site shows and scores it as a percentage. */
   value: num,
   stderr: optNum,
   n_samples: z.number().int().nullish(),
   limit_n: z.number().int().nullish(),
+  /** v1 field, kept for old rows; v2 runs send harness/harness_version instead. */
   lm_eval_version: optStr,
   gen_kwargs: z.record(z.string(), z.unknown()).default({}),
+  // schema v2: which harness produced this, over which pinned subset
+  harness: optStr,
+  harness_version: optStr,
+  subset_id: optStr,
+  n_tasks: z.number().int().nullish(),
+  attempts_per_task: z.number().int().nullish(),
 });
 
 export const RunRecord = z.object({
@@ -117,7 +127,8 @@ export const RunRecord = z.object({
 });
 
 export const IngestBody = z.object({
-  schema_version: z.literal(SCHEMA_VERSION),
+  /** v1 lab versions still publish speed runs; evals runs are v2 (see the refinement below). */
+  schema_version: z.union([z.literal(1), z.literal(2)]),
   bundle_sha: z.string(),
   base_model: BaseModelInfo,
   model: ModelInfo,
@@ -128,6 +139,14 @@ export const IngestBody = z.object({
   metrics: z.array(Metric),
   quality_ref: QualityRef.nullish(),
   eval_results: z.array(EvalResult).default([]),
+}).superRefine((b, ctx) => {
+  if (b.run.kind !== 'evals') return;
+  if (b.schema_version < 2) {
+    ctx.addIssue({ code: 'custom', path: ['schema_version'], message: 'evals runs require schema_version 2' });
+  }
+  if (b.run.tier !== 'quick' && b.run.tier !== 'deep') {
+    ctx.addIssue({ code: 'custom', path: ['run', 'tier'], message: "evals runs need tier 'quick' or 'deep'" });
+  }
 });
 
 export type IngestBody = z.infer<typeof IngestBody>;
@@ -138,9 +157,10 @@ export const HostedBody = z.object({
   chat_url: z.string().nullish(),
 });
 
-/** Mirror of lab/src/lab/publish.py put_pause(): benchmarks and `lab serve` pause the hosted model. */
+/** Mirror of lab/src/lab/publish.py put_pause(): benchmarks, evals and `lab serve` pause the hosted model;
+ * `starting` reports a model that is loading (vLLM takes minutes to boot). */
 export const PauseBody = z.object({
   paused: z.boolean(),
-  reason: z.enum(['bench', 'serve']).nullable(),
+  reason: z.enum(['bench', 'serve', 'evals', 'starting']).nullable(),
   ref: z.string().max(200).regex(/^[\w.-]+\/[\w.-]+$/).nullable(),
 });

@@ -117,6 +117,12 @@ CREATE TABLE IF NOT EXISTS eval_results (
   limit_n INTEGER,
   lm_eval_version TEXT,
   gen_kwargs_json TEXT NOT NULL DEFAULT '{}',
+  -- schema v2: which harness produced this, and over which pinned subset
+  harness TEXT,
+  harness_version TEXT,
+  subset_id TEXT,
+  n_tasks INTEGER,
+  attempts_per_task INTEGER,
   PRIMARY KEY (run_id, task, metric, filter)
 );
 

@@ -386,7 +386,10 @@ export function pageRoutes(db: Db, probe: ProbeFn) {
 
         <section>
           <h2>Task evals</h2>
-          {cfg.evals ? <MetricTable metrics={cfg.evals.metrics} /> : <p class="muted">Not measured yet.</p>}
+          {(() => {
+            const evals = cfg.evalsQuick ?? cfg.evalsDeep;
+            return evals ? <MetricTable metrics={evals.metrics} /> : <p class="muted">Not measured yet.</p>;
+          })()}
         </section>
 
         <section>

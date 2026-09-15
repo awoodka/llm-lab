@@ -16,6 +16,22 @@ export type MetricRow = {
   unit: string;
 };
 
+export type EvalRow = {
+  task: string;
+  metric: string;
+  filter: string;
+  value: number;
+  stderr: number | null;
+  n_samples: number | null;
+  limit_n: number | null;
+  lm_eval_version: string | null;
+  harness: string | null;
+  harness_version: string | null;
+  subset_id: string | null;
+  n_tasks: number | null;
+  attempts_per_task: number | null;
+};
+
 export type RunSummary = {
   id: string;
   kind: 'speed' | 'quality' | 'evals';
@@ -30,6 +46,7 @@ export type RunSummary = {
   commit_sha: string | null;
   driver: string;
   metrics: MetricRow[];
+  evals: EvalRow[];
   telemetry: Record<string, number>[];
 };
 
@@ -41,9 +58,13 @@ export type ConfigView = {
   params: Record<string, unknown>;
   launch_command: string;
   notes: string | null;
+  /** Engine-native speed (llama-bench). */
   speed: RunSummary | null;
+  /** Same-protocol chat benchmark over HTTP, comparable across engines. */
+  chat: RunSummary | null;
   quality: RunSummary | null;
-  evals: RunSummary | null;
+  evalsQuick: RunSummary | null;
+  evalsDeep: RunSummary | null;
   history: RunSummary[];
 };
 
@@ -75,17 +96,39 @@ function toRun(db: Db, r: Row, withTelemetry: boolean): RunSummary {
   const metrics = db
     .prepare('SELECT key, method, n_prompt, n_gen, depth, concurrency, value, stddev, n, unit FROM metrics WHERE run_id = ? ORDER BY key, depth, n_prompt, n_gen')
     .all(r.id) as MetricRow[];
+  const evals = db
+    .prepare(`SELECT task, metric, filter, value, stderr, n_samples, limit_n, lm_eval_version,
+                     harness, harness_version, subset_id, n_tasks, attempts_per_task
+              FROM eval_results WHERE run_id = ? ORDER BY task, metric`)
+    .all(r.id) as EvalRow[];
   return {
     id: r.id, kind: r.kind, tier: r.tier, started_at: r.started_at, duration_s: r.duration_s, throttled: !!r.throttled,
     cli_args: r.cli_args, lab_version: r.lab_version, engine: r.engine, engine_version: r.engine_version,
-    commit_sha: r.commit_sha, driver: r.driver, metrics,
+    commit_sha: r.commit_sha, driver: r.driver, metrics, evals,
     telemetry: withTelemetry ? JSON.parse(r.telemetry_json) : [],
   };
 }
 
-/** Latest run of a kind, preferring non-throttled runs. */
-function latestRun(db: Db, configId: number, kind: string): RunSummary | null {
-  const r = db.prepare(`${RUN_SQL} WHERE r.config_id = ? AND r.kind = ? ORDER BY r.throttled ASC, r.started_at DESC LIMIT 1`).get(configId, kind) as Row | undefined;
+/**
+ * Latest run of a kind, preferring non-throttled runs.
+ *
+ * `tier` separates quick from deep evals; without it the newer tier would hide the other. `methodLike`
+ * keeps runs measured different ways apart, so a chat-benchmark run never hides a llama-bench one.
+ */
+function latestRun(db: Db, configId: number, kind: string, opts: { tier?: string; methodLike?: string } = {}): RunSummary | null {
+  const where = [`r.config_id = ?`, `r.kind = ?`];
+  const args: unknown[] = [configId, kind];
+  if (opts.tier !== undefined) {
+    where.push('r.tier = ?');
+    args.push(opts.tier);
+  }
+  if (opts.methodLike !== undefined) {
+    where.push('EXISTS (SELECT 1 FROM metrics mt WHERE mt.run_id = r.id AND mt.method LIKE ?)');
+    args.push(opts.methodLike);
+  }
+  const r = db
+    .prepare(`${RUN_SQL} WHERE ${where.join(' AND ')} ORDER BY r.throttled ASC, r.started_at DESC LIMIT 1`)
+    .get(...(args as [])) as Row | undefined;
   return r ? toRun(db, r, true) : null;
 }
 
@@ -94,9 +137,11 @@ function loadConfigs(db: Db, modelId: number, withHistory: boolean): ConfigView[
   return rows.map((c) => ({
     id: c.id, slug: c.slug, name: c.name, config_hash: c.config_hash, params: JSON.parse(c.params_json),
     launch_command: c.launch_command, notes: c.notes,
-    speed: latestRun(db, c.id, 'speed'),
+    speed: latestRun(db, c.id, 'speed', { methodLike: 'llama-bench' }),
+    chat: latestRun(db, c.id, 'speed', { methodLike: 'http-%' }),
     quality: latestRun(db, c.id, 'quality'),
-    evals: latestRun(db, c.id, 'evals'),
+    evalsQuick: latestRun(db, c.id, 'evals', { tier: 'quick' }),
+    evalsDeep: latestRun(db, c.id, 'evals', { tier: 'deep' }),
     history: withHistory
       ? (db.prepare(`${RUN_SQL} WHERE r.config_id = ? ORDER BY r.started_at DESC`).all(c.id) as Row[]).map((r) => toRun(db, r, false))
       : [],

@@ -109,12 +109,14 @@ export function ingest(db: Db, body: IngestBody, replace: boolean) {
         x.samples ? JSON.stringify(x.samples) : null);
     }
     const insEval = db.prepare(
-      `INSERT INTO eval_results (run_id, task, metric, filter, value, stderr, n_samples, limit_n, lm_eval_version, gen_kwargs_json)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO eval_results (run_id, task, metric, filter, value, stderr, n_samples, limit_n, lm_eval_version, gen_kwargs_json,
+         harness, harness_version, subset_id, n_tasks, attempts_per_task)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     );
     for (const e of body.eval_results) {
       insEval.run(r.id, e.task, e.metric, e.filter, e.value, e.stderr ?? null, e.n_samples ?? null, e.limit_n ?? null,
-        e.lm_eval_version ?? null, JSON.stringify(e.gen_kwargs));
+        e.lm_eval_version ?? null, JSON.stringify(e.gen_kwargs),
+        e.harness ?? null, e.harness_version ?? null, e.subset_id ?? null, e.n_tasks ?? null, e.attempts_per_task ?? null);
     }
     return { status: 'created' as const };
   });

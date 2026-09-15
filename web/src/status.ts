@@ -54,16 +54,26 @@ export type PauseRow = {
   model_name: string | null;
 } | null;
 
+/** Why the model is down while something else holds the GPU. */
+export const PAUSE_REASONS = ['bench', 'evals', 'serve'] as const;
+export type PauseReason = (typeof PAUSE_REASONS)[number];
+
+/** `starting` isn't a pause: the model is loading. vLLM takes minutes, and a probe alone would say offline. */
+export const STARTING_FRESH_MS = 20 * 60 * 1000;
+
 export type HostingView =
   | { state: 'online' | 'starting' | 'offline'; hosted: HostedRow }
-  | { state: 'paused'; hosted: HostedRow; reason: 'bench' | 'serve'; model: { slug: string | null; name: string } };
+  | { state: 'paused'; hosted: HostedRow; reason: PauseReason; model: { slug: string | null; name: string } };
 
 export function hostingView(probe: Probe, hosted: HostedRow, pause: PauseRow, nowMs = Date.now()): HostingView {
   if (probe === 'up') return { state: 'online', hosted };
   if (probe === 'starting') return { state: 'starting', hosted };
-  if (pause?.paused && (pause.reason === 'bench' || pause.reason === 'serve') && nowMs - Date.parse(pause.since) < PAUSE_FRESH_MS) {
+  const age = pause ? nowMs - Date.parse(pause.since) : Number.POSITIVE_INFINITY;
+  const reason = PAUSE_REASONS.find((r) => r === pause?.reason);
+  if (pause?.paused && reason && age < PAUSE_FRESH_MS) {
     const refModel = pause.ref?.split('/')[0];
-    return { state: 'paused', hosted, reason: pause.reason, model: { slug: pause.model_slug, name: pause.model_name ?? refModel ?? 'a model' } };
+    return { state: 'paused', hosted, reason, model: { slug: pause.model_slug, name: pause.model_name ?? refModel ?? 'a model' } };
   }
+  if (pause?.paused && pause.reason === 'starting' && age < STARTING_FRESH_MS) return { state: 'starting', hosted };
   return { state: 'offline', hosted };
 }
