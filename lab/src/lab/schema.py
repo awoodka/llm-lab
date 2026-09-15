@@ -9,7 +9,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2  # the site still accepts v1 speed bundles; evals runs must be v2
 
 
 def canonical_hash(obj: Any) -> str:
@@ -31,7 +31,7 @@ class ModelInfo(BaseModel):
     slug: str
     name: str
     base: str
-    engine: Literal["llama.cpp", "exllamav3"]
+    engine: Literal["llama.cpp", "exllamav3", "vllm"]
     format: str
     quant: str
     bpw: float | None = None
@@ -98,6 +98,8 @@ class QualityRef(BaseModel):
 
 
 class EvalResult(BaseModel):
+    """One benchmark result. `task` uses the site's registry keys; value and stderr are fractions."""
+
     task: str
     metric: str
     filter: str = "none"
@@ -105,8 +107,14 @@ class EvalResult(BaseModel):
     stderr: float | None = None
     n_samples: int | None = None
     limit_n: int | None = None
-    lm_eval_version: str | None = None
+    lm_eval_version: str | None = None  # v1 field, kept for old rows
     gen_kwargs: dict[str, Any] = Field(default_factory=dict)
+    # v2: which harness produced this, over which pinned subset
+    harness: str | None = None
+    harness_version: str | None = None
+    subset_id: str | None = None
+    n_tasks: int | None = None
+    attempts_per_task: int | None = None
 
 
 class RunRecord(BaseModel):
