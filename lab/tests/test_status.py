@@ -54,6 +54,7 @@ def _fake_gpu(monkeypatch, calls, *, active=True, report_error=False):
         return True
 
     monkeypatch.setattr(hosted, "gpu_lock", fake_lock)
+    monkeypatch.setattr(hosted, "check_power_limit", lambda: calls.append("power"))
     monkeypatch.setattr(hosted, "hosted_active", lambda: active)
     monkeypatch.setattr(hosted, "stop_hosted", lambda: calls.append("stop"))
     monkeypatch.setattr(hosted, "start_hosted", lambda wait_health=True: calls.append("start") or True)
@@ -68,8 +69,41 @@ def test_exclusive_gpu_reports_the_pause_before_waiting_and_the_resume_after(mon
     with hosted.exclusive_gpu("bench speed gemma/32k-q8kv"):
         calls.append("body")
     assert calls == [
-        "lock", "stop", ("pause", True, "bench", "gemma/32k-q8kv"), "idle", "cool", "body", "start", ("pause", False, None, None),
+        "lock", "power", "stop", ("pause", True, "bench", "gemma/32k-q8kv"), "idle", "cool", "body", "start", ("pause", False, None, None),
     ]
+
+
+def test_power_limit_refusal_leaves_the_hosted_model_alone(monkeypatch):
+    from lab.gpu.power import PowerLimitTooHigh
+
+    calls = []
+    _fake_gpu(monkeypatch, calls)
+
+    def too_high():
+        calls.append("power")
+        raise PowerLimitTooHigh("GPU power limit is 280 W")
+
+    monkeypatch.setattr(hosted, "check_power_limit", too_high)
+    with pytest.raises(PowerLimitTooHigh):
+        with hosted.exclusive_gpu("bench speed gemma/32k-q8kv"):
+            calls.append("body")
+    assert calls == ["lock", "power"]
+
+
+@pytest.mark.parametrize(("limit", "env", "ok"), [(250.0, None, True), (280.0, None, False), (280.0, "280", True)])
+def test_check_power_limit(monkeypatch, limit, env, ok):
+    from lab.gpu import power
+
+    monkeypatch.setattr(power, "enforced_power_limit_w", lambda gpu_index=0: limit)
+    if env:
+        monkeypatch.setenv("LAB_MAX_POWER_W", env)
+    else:
+        monkeypatch.delenv("LAB_MAX_POWER_W", raising=False)
+    if ok:
+        assert power.check_power_limit() == limit
+    else:
+        with pytest.raises(power.PowerLimitTooHigh, match="280 W"):
+            power.check_power_limit()
 
 
 def test_exclusive_gpu_still_runs_and_resumes_when_reporting_fails(monkeypatch):

@@ -11,8 +11,8 @@ from dataclasses import dataclass, field
 
 import pynvml
 
-# Clock-event bits that mean real slowdown. SW power cap (0x04) is expected at a 280 W limit
-# and is tracked separately rather than flagging the run.
+# Clock-event bits that mean real slowdown. SW power cap (0x04) is expected under the host's power cap
+# (the host's power-limit service on pve) and is tracked separately rather than flagging the run.
 THROTTLE_BITS = 0x08 | 0x20 | 0x40 | 0x80  # HW slowdown, SW thermal, HW thermal, HW power brake
 POWER_CAP_BIT = 0x04
 
@@ -31,6 +31,14 @@ def vram_used_mb(h) -> float:
 def _clock_reasons(h) -> int:
     fn = getattr(pynvml, "nvmlDeviceGetCurrentClocksEventReasons", None) or pynvml.nvmlDeviceGetCurrentClocksThrottleReasons
     return fn(h)
+
+
+def _gfx_clock_mhz(h) -> float | None:
+    """Current graphics clock, to confirm the host's clock ceiling (nvidia-smi -lgc) held during a run."""
+    try:
+        return float(pynvml.nvmlDeviceGetClockInfo(h, pynvml.NVML_CLOCK_GRAPHICS))
+    except pynvml.NVMLError:
+        return None
 
 
 def _read_int(path: str) -> int | None:
@@ -145,6 +153,8 @@ class Telemetry:
                 "reasons": float(_clock_reasons(h)),
                 "ram_mb": (_read_int(f"{CGROUP}/memory.current") or 0) / 2**20,
             }
+            if (clock := _gfx_clock_mhz(h)) is not None:
+                s["clock_mhz"] = clock
             if self.watch_pid and (rss := _proc_rss_kb(self.watch_pid)) is not None:
                 s["proc_rss_mb"] = rss / 1024
             self.samples.append(s)
@@ -174,6 +184,8 @@ class Telemetry:
             "ram_peak_mb": max(ram_peak or 0.0, sampled_ram_peak),
             "proc_rss_peak_mb": max((s.get("proc_rss_mb", 0.0) for s in self.samples), default=0.0),
             "temp_max_c": max((s["temp_c"] for s in self.samples), default=0.0),
+            "power_max_w": max((s["power_w"] for s in self.samples), default=0.0),
+            "clock_max_mhz": max((s["clock_mhz"] for s in self.samples if "clock_mhz" in s), default=None),
             "throttled": any(r & THROTTLE_BITS for r in reasons),
             "power_capped_frac": (sum(1 for r in reasons if r & POWER_CAP_BIT) / len(reasons)) if reasons else 0.0,
             "phases": {

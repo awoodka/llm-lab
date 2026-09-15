@@ -16,6 +16,7 @@ from lab.catalog import BaseSpec, ConfigSpec, ModelSpec, Source
 from lab.engines.base import get_engine
 from lab.gpu import hosted
 from lab.gpu.lock import gpu_lock, is_locked, read_holder
+from lab.gpu.power import PowerLimitTooHigh, check_power_limit, max_power_w
 
 app = typer.Typer(no_args_is_help=True, help="Local LLM performance lab")
 model_app = typer.Typer(no_args_is_help=True, help="Manage models (base model + quant)")
@@ -41,6 +42,14 @@ def _fail(msg: str) -> None:
     raise typer.Exit(1)
 
 
+def _check_power() -> None:
+    """Refuse GPU work up front, before the lock or the hosted model are touched, when the power cap isn't in force."""
+    try:
+        check_power_limit()
+    except PowerLimitTooHigh as e:
+        _fail(str(e))
+
+
 @app.callback()
 def _startup() -> None:
     hosted.recover_paused_hosted()
@@ -62,7 +71,9 @@ def doctor() -> None:
         typer.echo(f"{'✔' if good else '✘'} {label:<14} {detail}")
 
     hw = hardware_snapshot()
-    line(True, "gpu", f"{hw.gpu_name} {hw.gpu_vram_mb} MiB, driver {hw.driver}, CUDA {hw.cuda}, limit {hw.power_limit_w:.0f} W")
+    cap = max_power_w()
+    line(hw.power_limit_w <= cap + 0.5, "gpu",
+         f"{hw.gpu_name} {hw.gpu_vram_mb} MiB, driver {hw.driver}, CUDA {hw.cuda}, limit {hw.power_limit_w:.0f} W (max {cap:.0f} W)")
     line(True, "host", f"{hw.cpu_model}, {hw.cpu_threads_visible} threads, {hw.ram_mb} MiB RAM")
     used = hosted.gpu_vram_used_mb()
     line(True, "vram", f"{used:.0f} MiB in use, {hosted.gpu_temp_c()} °C")
@@ -185,6 +196,7 @@ def serve(
     model, cfg = catalog.load_config(ref)
     argv = get_engine(model.engine).server_argv(model, cfg, host=host, port=port)
     typer.echo(shlex.join(argv))
+    _check_power()
     with hosted.exclusive_gpu(f"serve {ref}", wait=wait, cool=False):
         proc = subprocess.Popen(argv)
         try:
@@ -205,6 +217,7 @@ def bench(
     """Benchmark a config and store a local run (publish separately)."""
     from lab.bench.native_llamacpp import run_speed
 
+    _check_power()
     rd = run_speed(ref, wait=wait, keep_paused=keep_paused, reps=reps, cli_args=_cli_args())
     _print_run(rd)
     typer.echo(f"\nrun saved: {rd.path}\npublish with: lab publish {rd.path.name}")
@@ -273,6 +286,7 @@ Description=lab hosted LLM (promoted config)
 [Service]
 Type=simple
 ExecStartPre=/usr/bin/flock -n {lock} true
+ExecStartPre={python} -m lab.gpu.power
 ExecStart={script}
 Restart=on-failure
 RestartSec=30
@@ -286,7 +300,7 @@ WantedBy=default.target
 
 def _install_unit() -> None:
     unit = Path.home() / ".config/systemd/user" / hosted.UNIT
-    content = UNIT_TEMPLATE.format(lock=paths.GPU_LOCK, script=paths.HOSTED_SH)
+    content = UNIT_TEMPLATE.format(lock=paths.GPU_LOCK, script=paths.HOSTED_SH, python=sys.executable)
     if not unit.is_file() or unit.read_text() != content:
         unit.parent.mkdir(parents=True, exist_ok=True)
         unit.write_text(content)
@@ -294,12 +308,30 @@ def _install_unit() -> None:
     subprocess.run(["systemctl", "--user", "enable", hosted.UNIT], check=True, capture_output=True)
 
 
+def _rollback_promote(ref: str, previous: dict[Path, str]) -> None:
+    """`ref` never became healthy: end the unit's restart loop and bring back the model hosted before it."""
+    hosted.stop_hosted()
+    logs = f"journalctl --user -u {hosted.UNIT} -n 50"
+    prev_ref = json.loads(previous.get(paths.HOSTED_JSON, "{}")).get("ref")
+    if not prev_ref or prev_ref == ref:
+        _fail(f"{ref} failed to become healthy and there is no previous model to roll back to; the hosted model is stopped. See: {logs}")
+    for p, text in previous.items():
+        p.write_text(text)
+    if paths.HOSTED_SH in previous:
+        paths.HOSTED_SH.chmod(0o755)
+    healthy = hosted.start_hosted(wait_health=True)
+    _fail(f"{ref} failed to become healthy (see: {logs}); rolled back to {prev_ref}, "
+          f"which is {'healthy again' if healthy else 'NOT healthy either'}")
+
+
 @app.command()
 def promote(ref: str) -> None:
-    """Make a config the always-on hosted model."""
+    """Make a config the always-on hosted model. If it never becomes healthy, the previous one comes back."""
     model, cfg = catalog.load_config(ref)
     engine = get_engine(model.engine)
     argv = engine.server_argv(model, cfg, host="127.0.0.1", port=HOSTED_PORT)
+    _check_power()
+    previous = {p: p.read_text() for p in (paths.HOSTED_SH, paths.HOSTED_JSON) if p.is_file()}
     with gpu_lock(f"promote {ref}"):
         if hosted.hosted_active():
             hosted.stop_hosted()
@@ -312,7 +344,7 @@ def promote(ref: str) -> None:
         hosted.wait_gpu_idle()
     typer.echo(f"starting {ref} on 127.0.0.1:{HOSTED_PORT}…")
     if not hosted.start_hosted(wait_health=True):
-        _fail(f"hosted model failed to become healthy; see: journalctl --user -u {hosted.UNIT} -n 50")
+        _rollback_promote(ref, previous)
     typer.echo("healthy")
     try:
         from lab.publish import put_hosted

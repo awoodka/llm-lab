@@ -17,6 +17,7 @@ import pynvml
 
 from lab import paths
 from lab.gpu.lock import gpu_lock, is_locked
+from lab.gpu.power import check_power_limit
 
 UNIT = "lab-hosted.service"
 PAUSED_BY = paths.STATE / "paused_by.json"
@@ -153,6 +154,8 @@ def exclusive_gpu(purpose: str, wait: bool = False, keep_paused: bool = False, c
     was_active = False
     try:
         with gpu_lock(purpose, wait=wait):
+            # Before touching the hosted model, so a refusal never pauses chat.
+            check_power_limit()
             was_active = hosted_active()
             if was_active:
                 PAUSED_BY.write_text(json.dumps({"pid": os.getpid(), "purpose": purpose}))

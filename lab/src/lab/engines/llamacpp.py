@@ -105,14 +105,18 @@ class LlamaCpp:
         ]  # fmt: skip
 
     # -- identity --------------------------------------------------------------
+    @staticmethod
+    def parse_version(text: str) -> str | None:
+        """Build number from `--version`: "version: 0.4.0-dev (build 10883, commit 91f6a6cf3)", or the older "version: 5930 (a1b2c3d)"."""
+        m = re.search(r"\(build (\d+)", text) or re.search(r"version: (\d+) \(", text)
+        return m.group(1) if m else None
+
     def build_info(self) -> EngineBuild:
         def git(*args: str) -> str:
             return subprocess.run(["git", "-C", str(self.root), *args], capture_output=True, text=True).stdout.strip()
 
-        version = None
         out = subprocess.run([str(self.bin / "llama-server"), "--version"], capture_output=True, text=True)
-        if m := re.search(r"version: (\d+) \((\w+)\)", out.stdout + out.stderr):
-            version = m.group(1)
+        version = self.parse_version(out.stdout + out.stderr)
         cache = self.root / "build" / "CMakeCache.txt"
         flags = ";".join(sorted(f"{k}={v}" for k, v in BUILD_FLAG_RE.findall(cache.read_text()))) if cache.is_file() else None
         extra: dict = {"dirty": bool(git("status", "--porcelain", "--untracked-files=no"))}

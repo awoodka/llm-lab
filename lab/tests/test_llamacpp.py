@@ -62,3 +62,15 @@ def test_rows_to_metrics_power_windows():
     assert m[("tg_tps", 128)].stddev == 1.0
     assert m[("gpu_w_avg", 128)].value == 200.0
     assert m[("tokens_per_joule", 128)].value == 0.5
+
+
+@pytest.mark.parametrize(
+    ("text", "build"),
+    [
+        ("version: 0.4.0-dev (build 10883, commit 91f6a6cf3)\nbuilt with GNU 14.2.0 for Linux x86_64", "10883"),
+        ("version: 5930 (a1b2c3d4)", "5930"),
+        ("no version here", None),
+    ],
+)
+def test_parse_version(text, build):
+    assert LlamaCpp.parse_version(text) == build
