@@ -1,0 +1,6 @@
+slug: qwen3.8-27b
+name: Qwen3.8 27B
+family: qwen3.8
+params_b: 27.3
+arch: dense
+hf_repo: Qwen/Qwen3.8-27B

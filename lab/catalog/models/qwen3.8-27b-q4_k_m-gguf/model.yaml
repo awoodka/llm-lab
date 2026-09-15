@@ -1,0 +1,10 @@
+slug: qwen3.8-27b-q4_k_m-gguf
+name: Qwen3.8 27B Q4_K_M
+base: qwen3.8-27b
+engine: llama.cpp
+format: gguf
+quant: Q4_K_M
+source:
+  repo: bartowski/Qwen3.8-27B-GGUF
+  file: Qwen3.8-27B-Q4_K_M.gguf
+  revision: 125a02af4987b57c7deb88d7f2ec58a5725c07c0
