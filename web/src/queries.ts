@@ -1,0 +1,235 @@
+import type { Db } from './db.ts';
+import type { HostedRow, PauseRow } from './status.ts';
+
+type Row = Record<string, any>;
+
+export type MetricRow = {
+  key: string;
+  method: string;
+  n_prompt: number;
+  n_gen: number;
+  depth: number;
+  concurrency: number;
+  value: number;
+  stddev: number | null;
+  n: number | null;
+  unit: string;
+};
+
+export type RunSummary = {
+  id: string;
+  kind: 'speed' | 'quality' | 'evals';
+  tier: string | null;
+  started_at: string;
+  duration_s: number | null;
+  throttled: boolean;
+  cli_args: string | null;
+  lab_version: string | null;
+  engine: string;
+  engine_version: string | null;
+  commit_sha: string | null;
+  driver: string;
+  metrics: MetricRow[];
+  telemetry: Record<string, number>[];
+};
+
+export type ConfigView = {
+  id: number;
+  slug: string;
+  name: string;
+  config_hash: string;
+  params: Record<string, unknown>;
+  launch_command: string;
+  notes: string | null;
+  speed: RunSummary | null;
+  quality: RunSummary | null;
+  evals: RunSummary | null;
+  history: RunSummary[];
+};
+
+export type ModelView = {
+  id: number;
+  slug: string;
+  name: string;
+  engine: string;
+  format: string;
+  quant: string;
+  bpw: number | null;
+  file_size_bytes: number | null;
+  source_repo: string | null;
+  source_file: string | null;
+  source_revision: string | null;
+  notes: string | null;
+  base: { slug: string; name: string; family: string | null; params_b: number | null; active_params_b: number | null; arch: string };
+  configs: ConfigView[];
+};
+
+const RUN_SQL = `
+  SELECT r.id, r.kind, r.tier, r.started_at, r.duration_s, r.throttled, r.cli_args, r.lab_version, r.telemetry_json,
+         e.engine, e.version AS engine_version, e.commit_sha, h.driver
+  FROM runs r
+  JOIN engine_builds e ON e.id = r.engine_build_id
+  JOIN hardware_snapshots h ON h.id = r.hardware_id`;
+
+function toRun(db: Db, r: Row, withTelemetry: boolean): RunSummary {
+  const metrics = db
+    .prepare('SELECT key, method, n_prompt, n_gen, depth, concurrency, value, stddev, n, unit FROM metrics WHERE run_id = ? ORDER BY key, depth, n_prompt, n_gen')
+    .all(r.id) as MetricRow[];
+  return {
+    id: r.id, kind: r.kind, tier: r.tier, started_at: r.started_at, duration_s: r.duration_s, throttled: !!r.throttled,
+    cli_args: r.cli_args, lab_version: r.lab_version, engine: r.engine, engine_version: r.engine_version,
+    commit_sha: r.commit_sha, driver: r.driver, metrics,
+    telemetry: withTelemetry ? JSON.parse(r.telemetry_json) : [],
+  };
+}
+
+/** Latest run of a kind, preferring non-throttled runs. */
+function latestRun(db: Db, configId: number, kind: string): RunSummary | null {
+  const r = db.prepare(`${RUN_SQL} WHERE r.config_id = ? AND r.kind = ? ORDER BY r.throttled ASC, r.started_at DESC LIMIT 1`).get(configId, kind) as Row | undefined;
+  return r ? toRun(db, r, true) : null;
+}
+
+function loadConfigs(db: Db, modelId: number, withHistory: boolean): ConfigView[] {
+  const rows = db.prepare('SELECT * FROM configs WHERE model_id = ? ORDER BY created_at, id').all(modelId) as Row[];
+  return rows.map((c) => ({
+    id: c.id, slug: c.slug, name: c.name, config_hash: c.config_hash, params: JSON.parse(c.params_json),
+    launch_command: c.launch_command, notes: c.notes,
+    speed: latestRun(db, c.id, 'speed'),
+    quality: latestRun(db, c.id, 'quality'),
+    evals: latestRun(db, c.id, 'evals'),
+    history: withHistory
+      ? (db.prepare(`${RUN_SQL} WHERE r.config_id = ? ORDER BY r.started_at DESC`).all(c.id) as Row[]).map((r) => toRun(db, r, false))
+      : [],
+  }));
+}
+
+function toModel(db: Db, m: Row, withHistory: boolean): ModelView {
+  return {
+    id: m.id, slug: m.slug, name: m.name, engine: m.engine, format: m.format, quant: m.quant, bpw: m.bpw,
+    file_size_bytes: m.file_size_bytes, source_repo: m.source_repo, source_file: m.source_file,
+    source_revision: m.source_revision, notes: m.notes,
+    base: { slug: m.base_slug, name: m.base_name, family: m.family, params_b: m.params_b, active_params_b: m.active_params_b, arch: m.arch },
+    configs: loadConfigs(db, m.id, withHistory),
+  };
+}
+
+const MODEL_SQL = `
+  SELECT m.*, b.slug AS base_slug, b.name AS base_name, b.family, b.params_b, b.active_params_b, b.arch
+  FROM models m JOIN base_models b ON b.id = m.base_model_id`;
+
+export function getModels(db: Db): ModelView[] {
+  const rows = db.prepare(`${MODEL_SQL} WHERE EXISTS (SELECT 1 FROM configs c JOIN runs r ON r.config_id = c.id WHERE c.model_id = m.id) ORDER BY b.name, m.name`).all() as Row[];
+  return rows.map((m) => toModel(db, m, false));
+}
+
+export function getModel(db: Db, slug: string): ModelView | null {
+  const m = db.prepare(`${MODEL_SQL} WHERE m.slug = ?`).get(slug) as Row | undefined;
+  return m ? toModel(db, m, true) : null;
+}
+
+export function getRun(db: Db, id: string) {
+  const r = db.prepare(`${RUN_SQL} WHERE r.id = ?`).get(id) as Row | undefined;
+  if (!r) return null;
+  const extra = db.prepare(
+    `SELECT r.raw_json, c.slug AS config_slug, c.name AS config_name, m.slug AS model_slug, m.name AS model_name
+     FROM runs r JOIN configs c ON c.id = r.config_id JOIN models m ON m.id = c.model_id WHERE r.id = ?`,
+  ).get(id) as Row;
+  return { ...toRun(db, r, true), raw: JSON.parse(extra.raw_json), config_slug: extra.config_slug, config_name: extra.config_name, model_slug: extra.model_slug, model_name: extra.model_name };
+}
+
+export function getHosted(db: Db) {
+  return (db.prepare(
+    `SELECT h.since, c.slug AS config_slug, c.name AS config_name, m.slug AS model_slug, m.name AS model_name
+     FROM hosted h LEFT JOIN configs c ON c.config_hash = h.config_hash LEFT JOIN models m ON m.id = c.model_id WHERE h.id = 1`,
+  ).get() as HostedRow | undefined) ?? null;
+}
+
+/** Latest pause report from `lab` (benchmarks and `lab serve` pause the hosted model), with the model's name if published. */
+export function getPause(db: Db) {
+  return (db.prepare(
+    `SELECT p.paused, p.reason, p.ref, p.since, m.slug AS model_slug, m.name AS model_name
+     FROM hosted_pause p LEFT JOIN models m ON m.slug = substr(p.ref, 1, instr(p.ref, '/') - 1) WHERE p.id = 1`,
+  ).get() as PauseRow | undefined) ?? null;
+}
+
+export function getHardware(db: Db) {
+  return {
+    hardware: db.prepare('SELECT DISTINCT gpu_name, gpu_vram_mb, driver, cuda, power_limit_w, cpu_model, cpu_threads_visible, ram_mb FROM hardware_snapshots h WHERE EXISTS (SELECT 1 FROM runs r WHERE r.hardware_id = h.id)').all() as Row[],
+    builds: db.prepare('SELECT DISTINCT engine, commit_sha FROM engine_builds e WHERE EXISTS (SELECT 1 FROM runs r WHERE r.engine_build_id = e.id) ORDER BY engine').all() as Row[],
+  };
+}
+
+// -- metric selection ----------------------------------------------------------
+const METHOD_PREFERENCE = ['http', 'llama-bench'];
+
+export function pick(run: RunSummary | null, key: string, dims: Partial<Pick<MetricRow, 'depth' | 'n_prompt' | 'n_gen' | 'method'>> = {}): MetricRow | undefined {
+  if (!run) return undefined;
+  const matches = run.metrics.filter(
+    (m) => m.key === key && Object.entries(dims).every(([k, v]) => (m as Record<string, unknown>)[k] === v),
+  );
+  const rank = (m: MetricRow) => {
+    const i = METHOD_PREFERENCE.indexOf(m.method);
+    return i === -1 ? METHOD_PREFERENCE.length : i;
+  };
+  return matches.sort((a, b) => rank(a) - rank(b))[0];
+}
+
+export function depthsFor(run: RunSummary | null, key: string): number[] {
+  return [...new Set((run?.metrics ?? []).filter((m) => m.key === key).map((m) => m.depth))].sort((a, b) => a - b);
+}
+
+export type Headline = {
+  pp0?: MetricRow;
+  tg0?: MetricRow;
+  tgDeep?: MetricRow;
+  vram?: MetricRow;
+  tokJ?: MetricRow;
+  watts?: MetricRow;
+};
+
+export function headline(cfg: ConfigView): Headline {
+  const s = cfg.speed;
+  const tgDepths = depthsFor(s, 'tg_tps');
+  const deepest = tgDepths.at(-1);
+  return {
+    pp0: pick(s, 'pp_tps', { depth: 0 }),
+    tg0: pick(s, 'tg_tps', { depth: 0 }),
+    tgDeep: deepest ? pick(s, 'tg_tps', { depth: deepest }) : undefined,
+    vram: pick(s, 'vram_peak_mb'),
+    tokJ: pick(s, 'tokens_per_joule', { depth: 0, n_prompt: 0 }),
+    watts: pick(s, 'gpu_w_avg', { depth: 0, n_prompt: 0 }),
+  };
+}
+
+/** A config whose latest speed run may feed headline numbers: it exists and wasn't throttled. */
+export function isUsable(cfg: ConfigView): boolean {
+  return !!cfg.speed && !cfg.speed.throttled;
+}
+
+/** The config that represents a model: fastest generation at empty context, preferring non-throttled runs. */
+export function bestConfig(model: ModelView): ConfigView | undefined {
+  const tg0 = (cfg: ConfigView) => headline(cfg).tg0?.value ?? -1;
+  return [...model.configs].sort((a, b) => Number(isUsable(b)) - Number(isUsable(a)) || tg0(b) - tg0(a))[0];
+}
+
+export type Highlight = { m: ModelView; cfg: ConfigView; metric: MetricRow };
+
+export type SiteSummary = { models: number; configs: number; fastest?: Highlight; deepest?: Highlight; efficient?: Highlight };
+
+/** Homepage headline numbers. Throttled runs never count. */
+export function siteSummary(models: ModelView[]): SiteSummary {
+  const usable = models.flatMap((m) => m.configs.filter(isUsable).map((cfg) => ({ m, cfg })));
+  const best = (metric: (x: { m: ModelView; cfg: ConfigView }) => MetricRow | undefined): Highlight | undefined =>
+    usable
+      .map((x) => ({ ...x, metric: metric(x) }))
+      .filter((x): x is Highlight => x.metric !== undefined)
+      .sort((a, b) => b.metric.value - a.metric.value)[0];
+  const deepest = Math.max(0, ...usable.flatMap((x) => depthsFor(x.cfg.speed, 'tg_tps')));
+  return {
+    models: models.filter((m) => m.configs.some((cfg) => cfg.speed)).length,
+    configs: models.reduce((n, m) => n + m.configs.filter((cfg) => cfg.speed).length, 0),
+    fastest: best((x) => headline(x.cfg).tg0),
+    deepest: deepest > 0 ? best((x) => pick(x.cfg.speed, 'tg_tps', { depth: deepest })) : undefined,
+    efficient: best((x) => headline(x.cfg).tokJ),
+  };
+}

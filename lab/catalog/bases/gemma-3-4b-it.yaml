@@ -1,0 +1,6 @@
+slug: gemma-3-4b-it
+name: Gemma 3 4B IT
+family: gemma3
+params_b: 3.88
+arch: dense
+hf_repo: google/gemma-3-4b-it

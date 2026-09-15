@@ -1,0 +1,29 @@
+slug: 32k-f16kv
+name: 32k ctx, f16 KV
+params:
+  ctx: 32768
+  gpu_layers: 999
+  flash_attn: 'on'
+  cache_type_k: f16
+  cache_type_v: f16
+  batch: 2048
+  ubatch: 512
+  threads: 6
+  n_cpu_moe: 0
+  parallel: 1
+  load_mode: mmap
+  cache_ram_mib: 0
+  extra_args: []
+bench:
+  n_prompt: 512
+  n_gen: 128
+  depths:
+  - 0
+  - 4096
+  - 16384
+  reps: 5
+  delay_s: 3
+  http_prompt_lengths:
+  - 512
+  - 4096
+eval_overrides: {}

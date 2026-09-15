@@ -1,0 +1,20 @@
+# >>> llmlab (managed by /opt/llmlab/repo/deploy/apply-caddy.sh from llm-lab web/deploy/Caddyfile.llmlab; edit there)
+# ---- Local Inference: public benchmark site. Compose project "llmlab", alias llmlab-site on the edge network. ----
+# Only the site's pages listener (:3000) is proxied; its publishing API listens on another port, tailnet only.
+http://localinference.alexwoodka.com {
+	import secheaders
+	encode zstd gzip
+	reverse_proxy llmlab-site:3000
+}
+
+# ---- Local Inference chat: Open WebUI has NO login. Cloudflare Access (you@example.com only) is the gate. ----
+# Access adds Cf-Access-Jwt-Assertion to every request it lets through. This checks only that the header is present
+# (cloudflared's "Protect with Access" verifies the signature), so it stops visitors if the Access app is removed or
+# misconfigured, not someone forging the header from inside this server. No `encode`: token streaming stays unbuffered.
+http://chat.alexwoodka.com {
+	import secheaders
+	@no_access_jwt not header Cf-Access-Jwt-Assertion *
+	respond @no_access_jwt "Forbidden" 403
+	reverse_proxy llmlab-open-webui:8080
+}
+# <<< llmlab

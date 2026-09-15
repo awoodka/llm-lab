@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+.venv/
+node_modules/
+lab/runs/
+lab/state/
+lab/datasets/
+lab/settings.yaml
+web/data/
+web/backups/
+*.kld
+*.gguf
+.env

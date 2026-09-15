@@ -1,0 +1,99 @@
+# LLM Lab on `web`: the Local Inference site and its chat (Open WebUI).
+#
+# Public, through Caddy on the shared `edge` network (Caddy → cloudflared; see Caddyfile.llmlab):
+#   https://localinference.alexwoodka.com → site, pages listener :3000 (alias llmlab-site)
+#   https://chat.alexwoodka.com           → open-webui :8080 (alias llmlab-open-webui), behind Cloudflare Access
+# Tailnet only: the site's publishing API (:3100) is published on 127.0.0.1:3000, which `tailscale serve` exposes as
+# https://web.example-tailnet.ts.net for `lab publish` on ai. Nothing else is published on the host.
+# deploy.sh fails the deploy if exposure drifts; check-public.sh proves the chat is behind Access.
+# Secrets are interpolated from /opt/llmlab/.env (deploy.sh passes --env-file).
+name: llmlab
+
+x-logging: &logging
+  driver: json-file
+  options: { max-size: "10m", max-file: "3" }
+
+x-ai-host: &ai-host
+  # web runs with Tailscale DNS off (a DNS watchdog keeps it off), so pin ai's tailnet name. TLS still verifies it.
+  - "ai.example-tailnet.ts.net:100.64.0.1"
+
+services:
+  site:
+    build: ..
+    image: llmlab-site
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:3000:3100"   # publishing API only; the pages listener is reachable only by Caddy on `edge`
+    extra_hosts: *ai-host
+    environment:
+      HOST: 0.0.0.0
+      PAGES_PORT: "3000"
+      API_PORT: "3100"
+      DB_PATH: /data/lab.db
+      PUBLIC_ORIGIN: https://localinference.alexwoodka.com
+      CHAT_URL: https://chat.alexwoodka.com
+      MODEL_HEALTH_URL: https://ai.example-tailnet.ts.net:8443/health   # live chat status on the homepage
+      INGEST_TOKEN: ${INGEST_TOKEN:?missing from /opt/llmlab/.env}
+    volumes:
+      - /opt/llmlab-data/site:/data
+    user: "1000:1000"   # alex, who owns /opt/llmlab-data
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m   # tsx's transform cache
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    mem_limit: 512m
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/static/style.css').then((r) => process.exit(r.ok ? 0 : 1), () => process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    networks:
+      default:
+      edge:
+        aliases: [llmlab-site]
+    logging: *logging
+
+  open-webui:
+    image: ghcr.io/open-webui/open-webui:v0.11.3
+    restart: unless-stopped
+    extra_hosts: *ai-host
+    environment:
+      OPENAI_API_BASE_URL: https://ai.example-tailnet.ts.net:8443/v1
+      OPENAI_API_KEY: none   # llama-server and TabbyAPI on ai run without a key
+      ENABLE_OLLAMA_API: "false"
+      # No login of its own: Cloudflare Access (you@example.com only) is the gate. WEBUI_AUTH can only be
+      # changed before the first account exists, so turning it on later means resetting Open WebUI's data.
+      WEBUI_AUTH: "false"
+      WEBUI_NAME: Local Inference   # Open WebUI shows it as "Local Inference (Open WebUI)"
+      WEBUI_URL: https://chat.alexwoodka.com
+      CORS_ALLOW_ORIGIN: https://chat.alexwoodka.com
+      WEBUI_SESSION_COOKIE_SECURE: "true"
+      ENABLE_API_KEYS: "false"
+      WEBUI_SECRET_KEY: ${WEBUI_SECRET_KEY:?missing from /opt/llmlab/.env}
+      # Chat only: no retrieval, web search, image generation or code execution. Open WebUI still
+      # fetches its small default embedding model (MiniLM) at startup; ~730 MiB RSS in total.
+      BYPASS_EMBEDDING_AND_RETRIEVAL: "true"
+      RAG_EMBEDDING_MODEL_AUTO_UPDATE: "false"
+      ENABLE_WEB_SEARCH: "false"
+      ENABLE_IMAGE_GENERATION: "false"
+      ENABLE_CODE_INTERPRETER: "false"
+      ENABLE_EVALUATION_ARENA_MODELS: "false"
+      ENABLE_VERSION_UPDATE_CHECK: "false"
+      ANONYMIZED_TELEMETRY: "false"
+      DO_NOT_TRACK: "true"
+      SCARF_NO_ANALYTICS: "true"
+    volumes:
+      - /opt/llmlab-data/open-webui:/app/backend/data
+    security_opt: [no-new-privileges:true]
+    mem_limit: 2g
+    networks:
+      default:
+      edge:
+        aliases: [llmlab-open-webui]
+    logging: *logging
+
+networks:
+  edge:
+    name: edge
+    external: true

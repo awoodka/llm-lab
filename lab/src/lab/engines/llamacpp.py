@@ -1,0 +1,126 @@
+"""llama.cpp engine: llama-server / llama-bench argv rendering and build identity.
+
+Every knob is passed explicitly. In particular `--fit off` (default on silently rewrites unset
+args), `-np` (default auto) and `--cache-ram` (default 8192 MiB of host RAM) are always set.
+"""
+
+import re
+import shlex
+import subprocess
+from pathlib import Path
+
+from lab import catalog, paths
+from lab.catalog import ConfigSpec, ModelSpec, Params
+from lab.schema import EngineBuild
+
+BUILD_FLAG_RE = re.compile(r"^(CMAKE_BUILD_TYPE|CMAKE_CUDA_ARCHITECTURES|GGML_NATIVE|GGML_CUDA\w*):\w+=(.*)$", re.M)
+
+
+def _runtime_flags(p: Params) -> list[str]:
+    """Flags shared by llama-server and llama-bench (same spelling in both)."""
+    return [
+        "-ngl", str(p.gpu_layers),
+        "-fa", p.flash_attn,
+        "-ctk", p.cache_type_k,
+        "-ctv", p.cache_type_v,
+        "-b", str(p.batch),
+        "-ub", str(p.ubatch),
+        "-t", str(p.threads),
+        "-ncmoe", str(p.n_cpu_moe),
+        "-lm", p.load_mode,
+    ]  # fmt: skip
+
+
+def bench_depths(cfg: ConfigSpec) -> list[int]:
+    b = cfg.bench
+    fits = [d for d in b.depths if d + max(b.n_prompt, b.n_gen) <= cfg.params.ctx]
+    return sorted(set(fits)) or [0]
+
+
+class LlamaCpp:
+    name = "llama.cpp"
+
+    def __init__(self, root: Path | None = None):
+        self.root = root or paths.LLAMA_CPP
+        self.bin = self.root / "build" / "bin"
+
+    # -- server ----------------------------------------------------------------
+    def _server_argv(self, model: ModelSpec, cfg: ConfigSpec, *, host: str, port: int, binary: str, weights: str, draft: str | None) -> list[str]:
+        p = cfg.params
+        argv = [
+            binary, "-m", weights,
+            "--host", host, "--port", str(port),
+            "-a", f"{model.slug}/{cfg.slug}",
+            "--fit", "off",
+            "-c", str(p.ctx),
+            "-np", str(p.parallel),
+            "--cache-ram", str(p.cache_ram_mib),
+            *_runtime_flags(p),
+            "--metrics",
+        ]  # fmt: skip
+        if p.spec:
+            s = p.spec
+            argv += ["--spec-type", s.type, "-md", draft or "", "-ngld", str(s.gpu_layers), "--spec-draft-n-max", str(s.n_max)]
+            if s.cache_type_k:
+                argv += ["-ctkd", s.cache_type_k]
+            if s.cache_type_v:
+                argv += ["-ctvd", s.cache_type_v]
+        if p.reasoning_format:
+            argv += ["--reasoning-format", p.reasoning_format]
+        if p.reasoning_budget is not None:
+            argv += ["--reasoning-budget", str(p.reasoning_budget)]
+        return argv + p.extra_args
+
+    def server_argv(self, model: ModelSpec, cfg: ConfigSpec, *, host: str, port: int) -> list[str]:
+        weights = catalog.resolve_model_path(model)
+        draft = None
+        if cfg.params.spec:
+            draft = str(catalog.resolve_model_path(catalog.load_model(cfg.params.spec.model)))
+        return self._server_argv(model, cfg, host=host, port=port, binary=str(self.bin / "llama-server"), weights=str(weights), draft=draft)
+
+    def display_command(self, model: ModelSpec, cfg: ConfigSpec) -> str:
+        def shown(m: ModelSpec) -> str:
+            return m.source.file or (Path(m.source.path).name if m.source.path else m.slug)
+
+        draft = shown(catalog.load_model(cfg.params.spec.model)) if cfg.params.spec else None
+        return shlex.join(
+            self._server_argv(model, cfg, host="127.0.0.1", port=8080, binary="llama-server", weights=shown(model), draft=draft)
+        )
+
+    def render_files(self, model: ModelSpec, cfg: ConfigSpec) -> dict[str, str]:
+        return {}
+
+    # -- bench -----------------------------------------------------------------
+    def bench_argv(self, weights: Path, cfg: ConfigSpec) -> list[str]:
+        b = cfg.bench
+        return [
+            str(self.bin / "llama-bench"), "-m", str(weights),
+            "-o", "jsonl",
+            "-r", str(b.reps),
+            "--delay", str(b.delay_s),
+            *_runtime_flags(cfg.params),
+            "-p", str(b.n_prompt),
+            "-n", str(b.n_gen),
+            "-d", ",".join(str(d) for d in bench_depths(cfg)),
+        ]  # fmt: skip
+
+    # -- identity --------------------------------------------------------------
+    def build_info(self) -> EngineBuild:
+        def git(*args: str) -> str:
+            return subprocess.run(["git", "-C", str(self.root), *args], capture_output=True, text=True).stdout.strip()
+
+        version = None
+        out = subprocess.run([str(self.bin / "llama-server"), "--version"], capture_output=True, text=True)
+        if m := re.search(r"version: (\d+) \((\w+)\)", out.stdout + out.stderr):
+            version = m.group(1)
+        cache = self.root / "build" / "CMakeCache.txt"
+        flags = ";".join(sorted(f"{k}={v}" for k, v in BUILD_FLAG_RE.findall(cache.read_text()))) if cache.is_file() else None
+        extra: dict = {"dirty": bool(git("status", "--porcelain", "--untracked-files=no"))}
+        try:
+            nvcc = subprocess.run(["/usr/local/cuda/bin/nvcc", "--version"], capture_output=True, text=True).stdout
+            if m := re.search(r"release ([\d.]+)", nvcc):
+                extra["cuda_toolkit"] = m.group(1)
+        except FileNotFoundError:
+            pass
+        return EngineBuild(engine=self.name, version=version, commit_sha=git("rev-parse", "--short=9", "HEAD") or None,
+                           build_flags=flags, extra=extra)
