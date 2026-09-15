@@ -1,4 +1,6 @@
 import type { Db } from './db.ts';
+import { allowance, binomialStderr, byKey, issuesPerNight, quickScore, score } from './scoring.ts';
+import type { BenchScore, Score, SpeedPoint } from './scoring.ts';
 import type { HostedRow, PauseRow } from './status.ts';
 
 type Row = Record<string, any>;
@@ -244,6 +246,96 @@ export function headline(cfg: ConfigView): Headline {
     tokJ: pick(s, 'tokens_per_joule', { depth: 0, n_prompt: 0 }),
     watts: pick(s, 'gpu_w_avg', { depth: 0, n_prompt: 0 }),
   };
+}
+
+// -- capability scoring --------------------------------------------------------------------
+/** An 8,000-token prompt under the 5-minute quick-tier limit: the allowance the site shows. */
+export const HEADLINE_PROMPT_TOKENS = 8000;
+export const QUICK_LIMIT_S = 300;
+
+export type ScoredConfig = {
+  m: ModelView;
+  cfg: ConfigView;
+  /** Percent solved per benchmark key, from the latest run of each tier. */
+  scores: Record<string, BenchScore>;
+  score: Score | null;
+  quick: Score | null;
+  /** Generation t/s at `speedDepth`, from llama-bench or the chat benchmark. */
+  speed?: MetricRow;
+  promptSpeed?: MetricRow;
+  vram?: MetricRow;
+  allowance: number | null;
+  allowanceCapped: boolean;
+  issuesPerNight: number | null;
+  throttled: boolean;
+};
+
+/** Eval results of one run, as percentages keyed by task. */
+function evalScores(run: RunSummary | null): Record<string, BenchScore> {
+  const out: Record<string, BenchScore> = {};
+  for (const e of run?.evals ?? []) {
+    const bench = byKey.get(e.task);
+    if (!bench) continue;
+    const value = e.value * 100;
+    out[e.task] = { value, stderr: e.stderr != null ? e.stderr * 100 : binomialStderr(value, e.n_tasks ?? bench.n) };
+  }
+  return out;
+}
+
+/** Generation speed by depth for the allowance, preferring llama-bench's depth ladder. */
+function speedPoints(cfg: ConfigView): SpeedPoint[] {
+  const run = cfg.speed ?? cfg.chat;
+  return (run?.metrics ?? [])
+    .filter((m) => m.key === 'tg_tps' || m.key === 'decode_tps')
+    .map((m) => ({ depth: m.depth, tps: m.value }));
+}
+
+/**
+ * Every config with capability results, scored and ranked.
+ *
+ * Quick-tier runs count even when throttled: their allowances were fixed in advance from an earlier
+ * speed run. Deep-tier runs are wall-clock limited, so a throttled one is reported but never ranked.
+ */
+export function scoredConfigs(models: ModelView[]): ScoredConfig[] {
+  const out: ScoredConfig[] = [];
+  for (const m of models) {
+    for (const cfg of m.configs) {
+      const quickRun = cfg.evalsQuick;
+      const deepRun = cfg.evalsDeep;
+      if (!quickRun && !deepRun) continue;
+      const deepUsable = deepRun && !deepRun.throttled ? deepRun : null;
+      const scores = { ...evalScores(quickRun), ...evalScores(deepUsable) };
+      const speedRun = cfg.speed ?? cfg.chat;
+      const depths = depthsFor(speedRun, 'tg_tps');
+      const deepest = depths.at(-1);
+      const speed = deepest != null ? pick(speedRun, 'tg_tps', { depth: deepest }) : pick(speedRun, 'decode_tps');
+      const promptSpeed = pick(speedRun, 'pp_tps', { depth: 0 }) ?? pick(speedRun, 'prefill_tps');
+      const ctx = Number(cfg.params.ctx ?? 0);
+      const points = speedPoints(cfg);
+      const rawAllowance =
+        promptSpeed && points.length && ctx
+          ? allowance({ pp0: promptSpeed.value, tg: points, ctx, promptTokens: HEADLINE_PROMPT_TOKENS, limitS: QUICK_LIMIT_S })
+          : null;
+      const secondsPerIssue = pick(deepUsable, 'eval_seconds_per_task', { method: 'swebench_verified' });
+      const resolved = scores.swebench_verified?.value;
+      out.push({
+        m,
+        cfg,
+        scores,
+        score: score(scores),
+        quick: quickScore(scores),
+        speed,
+        promptSpeed,
+        vram: pick(speedRun, 'vram_peak_mb'),
+        allowance: rawAllowance,
+        allowanceCapped: rawAllowance != null && rawAllowance === ctx - HEADLINE_PROMPT_TOKENS,
+        issuesPerNight:
+          secondsPerIssue && resolved != null ? issuesPerNight(secondsPerIssue.value / 60, resolved) : null,
+        throttled: !!(quickRun?.throttled || deepRun?.throttled),
+      });
+    }
+  }
+  return out;
 }
 
 /** A config whose latest speed run may feed headline numbers: it exists and wasn't throttled. */

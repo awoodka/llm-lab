@@ -2,12 +2,14 @@ import { Hono, type Context } from 'hono';
 import type { Db } from '../db.ts';
 import { DASH, date, depthLabel, gb, num, testLabel } from '../format.ts';
 import {
-  bestConfig, depthsFor, getHardware, getHosted, getModel, getModels, getPause, getRun, headline, pick, siteSummary,
-  type ConfigView, type Headline, type ModelView,
+  HEADLINE_PROMPT_TOKENS, bestConfig, depthsFor, getHardware, getHosted, getModel, getModels, getPause, getRun,
+  headline, pick, scoredConfigs, siteSummary,
+  type ConfigView, type EvalRow, type Headline, type ModelView, type ScoredConfig,
 } from '../queries.ts';
+import { BENCHMARKS, CATEGORIES, byKey, rank } from '../scoring.ts';
 import { siteConfig } from '../site.ts';
 import { hostingView, type ProbeFn } from '../status.ts';
-import { Chart, HardwareFooter, Layout, Tile, type ChartSpec } from '../views/layout.tsx';
+import { Chart, HardwareFooter, Layout, Scoreboard, Tile, type ChartSpec, type ScoreboardRow, type ScoreboardSpec } from '../views/layout.tsx';
 import { Methodology } from '../views/methodology.tsx';
 import { StatusLine } from '../views/status.tsx';
 
@@ -44,6 +46,86 @@ function qs(current: Record<string, string>, patch: Record<string, string | unde
 
 const plural = (n: number, word: string) => `${n} ${word}${n === 1 ? '' : 's'}`;
 
+const CODING_INTRO =
+  'Every config ranked for coding work on one RTX 3090. The score weights coding 50%, agents & tools 30% and reasoning 20%, and combines them as a weighted geometric mean, so being weak in any one area pulls it down. Answers must finish within a thinking allowance taken from each config\u2019s own measured speed, so faster configs get more room to reason.';
+
+// -- capability scoreboard -----------------------------------------------------------------
+/** Benchmarks in the order the scoreboard and the table show them: by category, then registry order. */
+const BENCH_ORDER = CATEGORIES.flatMap((cat) => BENCHMARKS.filter((b) => b.category === cat.key));
+
+/** A category's first benchmark is drawn as a circle, its second as a diamond. */
+const SHAPES = new Map<string, 'circle' | 'diamond'>(
+  CATEGORIES.flatMap((cat) =>
+    BENCHMARKS.filter((b) => b.category === cat.key).map((b, i): [string, 'circle' | 'diamond'] => [b.key, i === 0 ? 'circle' : 'diamond']),
+  ),
+);
+
+const catName = (key: string) => CATEGORIES.find((c) => c.key === key)?.name ?? key;
+
+function allowanceText(tokens: number | null, capped: boolean): string {
+  if (tokens == null) return DASH;
+  const text = tokens < 1000 ? `${num(tokens, 0)} tokens` : `${num(tokens / 1000, 1)}k tokens`;
+  return capped ? `${text} (context limit)` : text;
+}
+
+/** A scoreboard row plus the config behind it, which only the server-rendered table needs. */
+type BoardRow = ScoreboardRow & { s: ScoredConfig };
+type BoardGroup = { title: string; rows: BoardRow[] };
+
+/** Ranked configs first, then the ones still missing their deep tier, sorted by quick score. */
+function boardGroups(scored: ScoredConfig[]): BoardGroup[] {
+  const row = (s: ScoredConfig, rankLabel: string, tieNote?: string): BoardRow => ({
+    s,
+    name: s.m.name,
+    config: s.cfg.name,
+    rankLabel,
+    tieNote,
+    scores: s.scores,
+    score: s.score,
+    quick: s.quick!,
+    speed: s.speed?.value ?? null,
+    promptSpeed: s.promptSpeed?.value ?? null,
+    allowance: s.allowance,
+    allowanceText: allowanceText(s.allowance, s.allowanceCapped),
+    issuesPerNight: s.issuesPerNight,
+    vramGb: s.vram ? s.vram.value / 1024 : null,
+  });
+  // A config with no quick tier has nothing to compare on either axis, so it stays off the board.
+  const shown = scored.filter((s) => s.quick);
+  const ranked = rank(shown.filter((s) => s.score).map((s) => ({ ...s, name: s.m.name, score: s.score! })));
+  const unranked = [...shown.filter((s) => !s.score)].sort((a, b) => b.quick!.value - a.quick!.value);
+  return [
+    {
+      title: 'Ranked \u00b7 all six benchmarks',
+      rows: ranked.map((r) =>
+        row(r, r.rankLabel, r.tiedWith.length ? `Too close to call with ${r.tiedWith.join(' and ')}: the scores are within one combined standard error.` : undefined),
+      ),
+    },
+    { title: 'Not ranked yet \u00b7 quick tier only', rows: unranked.map((s) => row(s, '\u2013')) },
+  ].filter((g) => g.rows.length > 0);
+}
+
+/** The context depth every speed bar was measured at, when the rows agree on one. */
+function sharedSpeedDepth(groups: BoardGroup[]): number | null {
+  const depths = [...new Set(groups.flatMap((g) => g.rows.map((r) => r.s.speed?.depth)).filter((d): d is number => d != null))];
+  return depths.length === 1 ? depths[0] : null;
+}
+
+const speedLabel = (depth: number | null) =>
+  depth == null ? 'Generation, deepest context measured \u00b7 t/s'
+    : depth === 0 ? 'Generation at empty context \u00b7 t/s'
+      : `Generation at ${depthLabel(depth)} context \u00b7 t/s`;
+
+function boardSpec(groups: BoardGroup[], depth: number | null): ScoreboardSpec {
+  return {
+    categories: CATEGORIES.map((c) => ({ key: c.key, name: c.name, weight: c.weight })),
+    benchmarks: BENCH_ORDER.map((b) => ({ key: b.key, name: b.name, category: b.category, tier: b.tier, size: b.size, shape: SHAPES.get(b.key)! })),
+    // The spec is inlined into the page, so each row carries only the numbers the drawing needs.
+    groups: groups.map((g) => ({ title: g.title, rows: g.rows.map(({ s, ...rest }) => rest) })),
+    speedLabel: speedLabel(depth),
+  };
+}
+
 /** Branded 404, registered on the top-level pages app (see app.ts). */
 export function notFoundPage(c: Context) {
   return c.html(
@@ -67,6 +149,17 @@ export function pageRoutes(db: Db, probe: ProbeFn) {
     const { chatUrl } = siteConfig();
     const modelLink = (x?: { m: ModelView; cfg: ConfigView }) => x && <a href={modelUrl(x.m, x.cfg)}>{x.m.name}</a>;
 
+    // Capability leads once a config has all six benchmarks; until then the speed tiles stand.
+    const ranked = scoredConfigs(models).filter((s) => s.score);
+    const bestBy = (value: (s: ScoredConfig) => number | null | undefined) =>
+      ranked
+        .map((s) => ({ s, v: value(s) }))
+        .filter((x): x is { s: ScoredConfig; v: number } => x.v != null)
+        .sort((a, b) => b.v - a.v)[0];
+    const bestScore = bestBy((s) => s.score!.value);
+    const bestCategory = (key: string) => bestBy((s) => s.score!.categories.find((cat) => cat.key === key)?.mean);
+    const bestNight = bestBy((s) => s.issuesPerNight);
+
     return c.html(
       <Layout title="Local Inference · open-weight LLMs on one RTX 3090" tab="home" path="/" footer={<HardwareFooter {...getHardware(db)} />}>
         <section class="intro">
@@ -75,7 +168,21 @@ export function pageRoutes(db: Db, probe: ProbeFn) {
           <p><a href="/methodology">How it's measured →</a></p>
         </section>
 
-        {summary.fastest ? (
+        {bestScore ? (
+          <section class="tiles" aria-label="Headline results">
+            <Tile
+              label="Best for coding work"
+              value={num(bestScore.v, 1)}
+              unit={`\u00b1 ${num(bestScore.s.score!.stderr, 1)}`}
+              note={modelLink(bestScore.s)}
+            />
+            {CATEGORIES.filter((cat) => cat.key !== 'reasoning').map((cat) => {
+              const b = bestCategory(cat.key);
+              return b && <Tile label={`Best at ${cat.name.toLowerCase()}`} value={num(b.v, 1)} unit="% solved" note={modelLink(b.s)} />;
+            })}
+            {bestNight && <Tile label="Most issues fixed per night" value={num(bestNight.v, 0)} unit="issues" note={modelLink(bestNight.s)} />}
+          </section>
+        ) : summary.fastest ? (
           <section class="tiles" aria-label="Headline results">
             <Tile label="Fastest generation" value={num(summary.fastest.metric.value)} unit="t/s" note={modelLink(summary.fastest)} />
             {summary.deepest && (
@@ -106,7 +213,7 @@ export function pageRoutes(db: Db, probe: ProbeFn) {
     );
   });
 
-  // -- benchmarks: compare every model ----------------------------------------------------
+  // -- benchmarks: capability first, speed alongside --------------------------------------
   app.get('/benchmarks', async (c) => {
     const q = c.req.query();
     const models = getModels(db);
@@ -114,6 +221,13 @@ export function pageRoutes(db: Db, probe: ProbeFn) {
     const { chatUrl } = siteConfig();
     const engines = [...new Set(models.map((m) => m.engine))].sort();
     const bases = [...new Map(models.map((m) => [m.base.slug, m.base.name])).entries()].sort((a, b) => a[1].localeCompare(b[1]));
+    const matches = (m: ModelView) => (!q.engine || m.engine === q.engine) && (!q.arch || m.base.arch === q.arch) && (!q.base || m.base.slug === q.base);
+
+    const groups = boardGroups(scoredConfigs(models).filter((s) => matches(s.m)));
+    const depth = sharedSpeedDepth(groups);
+    const speedOnly = models.filter(matches).flatMap((m) => m.configs).filter((cfg) => cfg.speed && !cfg.evalsQuick && !cfg.evalsDeep).length;
+    // Capability is the default view, but an empty scoreboard helps nobody: fall back until it has rows.
+    const tab = q.view === 'speed' || (q.view !== 'coding' && groups.length === 0) ? 'speed' : 'coding';
 
     let rows: Row[] = q.all
       ? models.flatMap((m) => m.configs.filter((cfg) => cfg.speed).map((cfg) => ({ m, cfg, h: headline(cfg) })))
@@ -121,7 +235,7 @@ export function pageRoutes(db: Db, probe: ProbeFn) {
           const cfg = bestConfig(m);
           return cfg ? [{ m, cfg, h: headline(cfg) }] : [];
         });
-    rows = rows.filter((r) => (!q.engine || r.m.engine === q.engine) && (!q.arch || r.m.base.arch === q.arch) && (!q.base || r.m.base.slug === q.base));
+    rows = rows.filter((r) => matches(r.m));
 
     const sortCol = COLUMNS.find((col) => col.key === q.sort) ?? COLUMNS.find((col) => col.key === 'tg0')!;
     const dir = q.dir === 'asc' ? 1 : q.dir === 'desc' ? -1 : sortCol.numeric ? -1 : 1;
@@ -151,8 +265,13 @@ export function pageRoutes(db: Db, probe: ProbeFn) {
         title="Benchmarks"
         tab="benchmarks"
         path="/benchmarks"
-        description="Every model and config benchmarked on one RTX 3090, side by side: generation and prompt speed, context depth, VRAM, power and tokens per joule."
-        charts
+        description={
+          tab === 'coding'
+            ? 'Open-weight models ranked for the work they do on one RTX 3090: coding, agents and tools, and reasoning, each answered inside a thinking allowance earned from the config’s own measured speed.'
+            : 'Every model and config benchmarked on one RTX 3090, side by side: generation and prompt speed, context depth, VRAM, power and tokens per joule.'
+        }
+        charts={tab === 'speed'}
+        scoreboard={tab === 'coding'}
         footer={<HardwareFooter {...getHardware(db)} />}
       >
         <section class="banner">
@@ -160,64 +279,118 @@ export function pageRoutes(db: Db, probe: ProbeFn) {
           {chatUrl && <a class="button" href={chatUrl}>Open chat ↗</a>}
         </section>
         <h1>Model benchmarks</h1>
-        <p class="meta">Local model performance, measured on one machine. <a href="/methodology">How it's measured</a></p>
         {models.length === 0 ? (
           <section class="empty">
             <p>No published results yet.</p>
           </section>
         ) : (
           <>
+            <nav class="tabs" aria-label="Benchmark view">
+              <a href={qs(q, { view: 'coding' })} aria-current={tab === 'coding' ? 'page' : undefined}>Coding work</a>
+              <a href={qs(q, { view: 'speed' })} aria-current={tab === 'speed' ? 'page' : undefined}>Speed</a>
+            </nav>
+            <p class="meta">
+              {tab === 'coding' ? CODING_INTRO : 'Local model performance, measured on one machine.'} <a href="/methodology">How it's measured</a>
+            </p>
+
             <form class="filters" method="get">
               <label>Engine <select name="engine"><option value="">All</option>{engines.map((e) => <option value={e} selected={q.engine === e}>{e}</option>)}</select></label>
               <label>Base model <select name="base"><option value="">All</option>{bases.map(([slug, name]) => <option value={slug} selected={q.base === slug}>{name}</option>)}</select></label>
               <label>Architecture <select name="arch"><option value="">All</option><option value="dense" selected={q.arch === 'dense'}>Dense</option><option value="moe" selected={q.arch === 'moe'}>MoE</option></select></label>
-              <label class="check"><input type="checkbox" name="all" value="1" checked={!!q.all} /> Show every config</label>
+              {tab === 'speed'
+                ? <label class="check"><input type="checkbox" name="all" value="1" checked={!!q.all} /> Show every config</label>
+                : q.all && <input type="hidden" name="all" value={q.all} />}
+              <input type="hidden" name="view" value={tab} />
               {q.sort && <input type="hidden" name="sort" value={q.sort} />}
               {q.dir && <input type="hidden" name="dir" value={q.dir} />}
               <button type="submit">Apply</button>
             </form>
-            <p class="muted small">{q.all ? 'Every benchmarked config.' : 'One row per model, using its fastest config (generation speed, empty context).'} Speeds are means of repeated llama-bench runs on this machine.</p>
 
-            <div class="table-wrap">
-              <table class="data">
-                <thead>
-                  <tr>
-                    {COLUMNS.map((col) => {
-                      const active = col.key === sortCol.key;
-                      const nextDir = active ? (dir === -1 ? 'asc' : 'desc') : col.numeric ? 'desc' : 'asc';
-                      return (
-                        <th class={col.numeric ? 'num' : ''} aria-sort={active ? (dir === -1 ? 'descending' : 'ascending') : undefined}>
-                          <a href={qs(q, { sort: col.key, dir: nextDir })}>{col.label}{active ? (dir === -1 ? ' ↓' : ' ↑') : ''}</a>
-                        </th>
-                      );
-                    })}
-                  </tr>
-                </thead>
-                <tbody>
-                  {rows.map((r) => (
-                    <tr>
-                      {COLUMNS.map((col) =>
-                        col.key === 'model' ? (
-                          <td>
-                            <a href={modelUrl(r.m, r.cfg)}>{r.m.name}</a>
-                            {r.cfg.speed?.throttled && <span class="tag">throttled</span>}
-                            <div class="muted small">{r.m.quant} · {r.m.base.arch}</div>
-                          </td>
-                        ) : (
-                          <td class={col.numeric ? 'num' : ''}>{col.show(r)}</td>
-                        ),
-                      )}
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
+            {tab === 'coding' ? (
+              groups.length === 0 ? (
+                <section class="empty">
+                  <p>
+                    No capability evals published yet. Every config gets the quick tier overnight; until then, the{' '}
+                    <a href={qs(q, { view: 'speed' })}>Speed tab</a> has what each one delivers.
+                  </p>
+                </section>
+              ) : (
+                <>
+                  <Scoreboard
+                    id="scoreboard"
+                    title="Coding work, every config"
+                    subtitle="Rows are ranked by score. Each row has three lines, top to bottom: coding, agents & tools, reasoning. Hover or tap a mark for details, or tab through the rows. The table below lists every number."
+                    spec={boardSpec(groups, depth)}
+                  />
 
-            {withTg.length > 0 && (
-              <div class="grid-2">
-                <Chart id="chart-tg" title="Generation speed" subtitle="Tokens per second at empty context. Click a bar to open the model." spec={tgBar} height={Math.max(160, byTg.length * 36 + 70)} />
-                <Chart id="chart-size" title="Speed vs weight size" subtitle="Bigger weights mean more memory traffic per token." spec={sizeScatter} />
-              </div>
+                  <h2>Capability benchmarks</h2>
+                  <p class="meta">Percent of tasks solved. The score carries ± one standard error, and rows sharing a rank are too close to call.</p>
+                  <CapabilityTable groups={groups} depth={depth} />
+                  {speedOnly > 0 && (
+                    <p class="muted small">
+                      {plural(speedOnly, 'config')} {speedOnly === 1 ? 'has' : 'have'} speed numbers but no capability evals yet; they are on the{' '}
+                      <a href={qs(q, { view: 'speed' })}>Speed tab</a>.
+                    </p>
+                  )}
+
+                  <section class="notes">
+                    <h2>How the score works</h2>
+                    <ul>
+                      <li><strong>Quick tier</strong>, every config: LiveCodeBench (100 problems), BFCL (400 cases), GPQA Diamond (198 questions) and AIME 2025 (30 problems × 4 attempts). Limit: 5 minutes per task.</li>
+                      <li><strong>Deep tier</strong>, only for configs worth a night each: SWE-bench Verified (30 issues, solved by mini-SWE-agent) and Terminal-Bench (30 tasks). Limit: 20 minutes per task. Configs without it aren't ranked, because quick-tier scores aren't comparable with full ones.</li>
+                      <li><strong>Thinking allowance</strong> = (time limit − time to read the prompt) × generation speed at that depth, capped by the config's context. The table shows it for an 8k-token prompt in a 5-minute task. An answer that doesn't finish inside it counts as wrong.</li>
+                      <li><strong>Too close to call</strong>: scores within one combined standard error of each other share a rank, shown as "=2".</li>
+                      <li><strong>Issues fixed per night</strong> = 8 hours ÷ average time per SWE-bench issue × fix rate.</li>
+                    </ul>
+                  </section>
+                </>
+              )
+            ) : (
+              <>
+                <p class="muted small">{q.all ? 'Every benchmarked config.' : 'One row per model, using its fastest config (generation speed, empty context).'} Speeds are means of repeated llama-bench runs on this machine.</p>
+
+                <div class="table-wrap">
+                  <table class="data">
+                    <thead>
+                      <tr>
+                        {COLUMNS.map((col) => {
+                          const active = col.key === sortCol.key;
+                          const nextDir = active ? (dir === -1 ? 'asc' : 'desc') : col.numeric ? 'desc' : 'asc';
+                          return (
+                            <th class={col.numeric ? 'num' : ''} aria-sort={active ? (dir === -1 ? 'descending' : 'ascending') : undefined}>
+                              <a href={qs(q, { sort: col.key, dir: nextDir })}>{col.label}{active ? (dir === -1 ? ' ↓' : ' ↑') : ''}</a>
+                            </th>
+                          );
+                        })}
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {rows.map((r) => (
+                        <tr>
+                          {COLUMNS.map((col) =>
+                            col.key === 'model' ? (
+                              <td>
+                                <a href={modelUrl(r.m, r.cfg)}>{r.m.name}</a>
+                                {r.cfg.speed?.throttled && <span class="tag">throttled</span>}
+                                <div class="muted small">{r.m.quant} · {r.m.base.arch}</div>
+                              </td>
+                            ) : (
+                              <td class={col.numeric ? 'num' : ''}>{col.show(r)}</td>
+                            ),
+                          )}
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+
+                {withTg.length > 0 && (
+                  <div class="grid-2">
+                    <Chart id="chart-tg" title="Generation speed" subtitle="Tokens per second at empty context. Click a bar to open the model." spec={tgBar} height={Math.max(160, byTg.length * 36 + 70)} />
+                    <Chart id="chart-size" title="Speed vs weight size" subtitle="Bigger weights mean more memory traffic per token." spec={sizeScatter} />
+                  </div>
+                )}
+              </>
             )}
           </>
         )}
@@ -243,7 +416,9 @@ export function pageRoutes(db: Db, probe: ProbeFn) {
   app.get('/m/:slug', (c) => {
     const model = getModel(db, c.req.param('slug'));
     if (!model) return c.notFound();
-    const cfg = model.configs.find((x) => x.slug === c.req.query('c')) ?? bestConfig(model) ?? model.configs[0];
+    const scored = scoredConfigs([model]);
+    const topRanked = scored.filter((s) => s.score).sort((a, b) => b.score!.value - a.score!.value)[0];
+    const cfg = model.configs.find((x) => x.slug === c.req.query('c')) ?? topRanked?.cfg ?? bestConfig(model) ?? model.configs[0];
     if (!cfg) return c.notFound();
     const h = headline(cfg);
     const emphasis = model.configs.length > MAX_SLOTS;
@@ -385,11 +560,8 @@ export function pageRoutes(db: Db, probe: ProbeFn) {
         </section>
 
         <section>
-          <h2>Task evals</h2>
-          {(() => {
-            const evals = cfg.evalsQuick ?? cfg.evalsDeep;
-            return evals ? <MetricTable metrics={evals.metrics} /> : <p class="muted">Not measured yet.</p>;
-          })()}
+          <h2>Capability</h2>
+          <Capability cfg={cfg} scored={scored.find((s) => s.cfg.id === cfg.id)} />
         </section>
 
         <section>
@@ -440,6 +612,12 @@ export function pageRoutes(db: Db, probe: ProbeFn) {
         </div>
         <h2>Metrics</h2>
         <MetricTable metrics={run.metrics} />
+        {run.evals.length > 0 && (
+          <>
+            <h2>Eval results</h2>
+            <EvalTable evals={run.evals} />
+          </>
+        )}
         <h2>Raw</h2>
         <pre class="raw">{JSON.stringify(run.raw, null, 2)}</pre>
       </Layout>,
@@ -464,6 +642,176 @@ const MetricTable = (props: { metrics: { key: string; method: string; n_prompt: 
             <td class="num">{num(m.value)}</td>
             <td class="num">{num(m.stddev)}</td>
             <td>{m.unit}</td>
+          </tr>
+        ))}
+      </tbody>
+    </table>
+  </div>
+);
+
+/** The scoreboard's numbers as a table: the equivalent for readers without JavaScript. */
+const CapabilityTable = (props: { groups: BoardGroup[]; depth: number | null }) => {
+  const cells = (render: (b: (typeof BENCH_ORDER)[number], first: boolean) => unknown) =>
+    CATEGORIES.flatMap((cat) => BENCHMARKS.filter((b) => b.category === cat.key).map((b, i) => render(b, i === 0)));
+  return (
+    <div class="table-wrap">
+      <table class="data">
+        <thead>
+          <tr>
+            <th rowspan={2} class="num">#</th>
+            <th rowspan={2}>Model · config</th>
+            <th rowspan={2} class="num">Score</th>
+            {CATEGORIES.map((cat) => (
+              <th colspan={BENCHMARKS.filter((b) => b.category === cat.key).length} class="grp grp-start">
+                <span class="key" style={`--k: var(--cat-${cat.key})`}></span>{cat.name} · {Math.round(cat.weight * 100)}%
+              </th>
+            ))}
+            <th colspan={3} class="grp grp-start">Speed</th>
+          </tr>
+          <tr>
+            {cells((b, first) => <th class={first ? 'num grp-start' : 'num'}>{b.name}</th>)}
+            <th class="num grp-start">{props.depth != null ? `Gen @${depthLabel(props.depth)}` : 'Generation'}</th>
+            <th class="num">Thinking allowance</th>
+            <th class="num">Fixed / night</th>
+          </tr>
+        </thead>
+        <tbody>
+          {props.groups.map((g) => (
+            <>
+              <tr class="group-row"><td colspan={12}>{g.title}</td></tr>
+              {g.rows.map((r) => (
+                <tr>
+                  <td class="num rank">{r.rankLabel}</td>
+                  <td>
+                    <div class="model-name">
+                      <a href={modelUrl(r.s.m, r.s.cfg)}>{r.name}</a>
+                      {!r.score && <span class="tag">quick tier only</span>}
+                      {r.s.throttled && <span class="tag">throttled</span>}
+                    </div>
+                    <div class="muted small">{r.config}</div>
+                  </td>
+                  <td class="num">
+                    {r.score
+                      ? <>{num(r.score.value, 1)}<span class="muted small"> ± {num(r.score.stderr, 1)}</span></>
+                      : <span class="muted">quick {num(r.quick.value, 1)}</span>}
+                  </td>
+                  {cells((b, first) => {
+                    const v = r.scores[b.key];
+                    return (
+                      <td class={`num${first ? ' grp-start' : ''}${v ? '' : ' muted'}`} title={v ? undefined : 'Not run yet'}>
+                        {v ? num(v.value, 1) : DASH}
+                      </td>
+                    );
+                  })}
+                  <td class="num grp-start">
+                    {r.speed != null ? `${num(r.speed)}${props.depth == null && r.s.speed ? ` @${depthLabel(r.s.speed.depth)}` : ''}` : DASH}
+                  </td>
+                  <td class="num">{r.allowanceText}</td>
+                  <td class={`num${r.issuesPerNight == null ? ' muted' : ''}`}>{r.issuesPerNight ?? DASH}</td>
+                </tr>
+              ))}
+            </>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+};
+
+/** One config's capability: the score it earns, and every benchmark behind it. */
+const Capability = (props: { cfg: ConfigView; scored?: ScoredConfig }) => {
+  const s = props.scored;
+  if (!s) {
+    return (
+      <p class="muted">
+        Not measured yet. The quick tier (LiveCodeBench, BFCL, GPQA Diamond, AIME 2025) runs for every config;
+        SWE-bench Verified and Terminal-Bench run for the configs worth a night each.
+      </p>
+    );
+  }
+  const total = s.score ?? s.quick;
+  const runFor = (tier: string) => (tier === 'quick' ? props.cfg.evalsQuick : props.cfg.evalsDeep);
+  return (
+    <>
+      <section class="tiles">
+        <Tile
+          label={s.score ? 'Coding-work score' : 'Quick-tier score'}
+          value={total ? num(total.value, 1) : DASH}
+          unit={total ? `± ${num(total.stderr, 1)}` : undefined}
+          note={s.score ? 'all six benchmarks' : 'not ranked: the deep tier has not run'}
+        />
+        {(total?.categories ?? []).map((cat) => (
+          <Tile label={cat.name} value={num(cat.mean, 1)} unit="% solved" note={`${Math.round(cat.weight * 100)}% of the score`} />
+        ))}
+        <Tile
+          label="Thinking allowance"
+          value={allowanceText(s.allowance, s.allowanceCapped)}
+          note={`${depthLabel(HEADLINE_PROMPT_TOKENS)}-token prompt, 5-minute task`}
+        />
+      </section>
+      <div class="table-wrap">
+        <table class="data">
+          <thead>
+            <tr>
+              <th>Benchmark</th>
+              <th>Tier</th>
+              <th class="num">Solved</th>
+              <th class="num">Tasks</th>
+              <th class="num">Allowance</th>
+              <th class="num">Length stops</th>
+              <th class="num">s / task</th>
+              <th>Harness</th>
+              <th>Run</th>
+            </tr>
+          </thead>
+          <tbody>
+            {BENCH_ORDER.map((b) => {
+              const run = runFor(b.tier);
+              const e = run?.evals.find((x) => x.task === b.key);
+              const v = s.scores[b.key];
+              const metric = (key: string) => (e ? pick(run ?? null, key, { method: b.key })?.value : undefined);
+              return (
+                <tr>
+                  <td>
+                    {b.name}
+                    <div class="muted small">{catName(b.category)} · {b.metric} · {b.size}</div>
+                  </td>
+                  <td>{b.tier}</td>
+                  <td class="num">{v ? <>{num(v.value, 1)}<span class="muted small"> ± {num(v.stderr, 1)}</span></> : DASH}</td>
+                  <td class="num">{e?.n_tasks != null ? `${e.n_tasks}${e.attempts_per_task && e.attempts_per_task > 1 ? ` × ${e.attempts_per_task}` : ''}` : DASH}</td>
+                  <td class="num">{num(metric('eval_allowance_tokens'), 0)}</td>
+                  <td class="num">{num(metric('eval_length_stops'), 0)}</td>
+                  <td class="num">{num(metric('eval_seconds_per_task'), 0)}</td>
+                  <td>{e?.harness ?? DASH}{e?.harness_version ? <span class="muted small"> {e.harness_version}</span> : ''}</td>
+                  <td>{e && run ? <a href={`/runs/${run.id}`}>{date(run.started_at)}</a> : DASH}</td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+      {(s.cfg.evalsQuick?.throttled || s.cfg.evalsDeep?.throttled) && (
+        <p class="warn">⚠ An eval run hit throttling. Quick-tier allowances were fixed in advance, so those results still count; a throttled deep-tier run is shown but never ranked.</p>
+      )}
+    </>
+  );
+};
+
+const EvalTable = (props: { evals: EvalRow[] }) => (
+  <div class="table-wrap">
+    <table class="data">
+      <thead><tr><th>Task</th><th>Metric</th><th class="num">Value</th><th class="num">± se</th><th class="num">Tasks</th><th class="num">Attempts</th><th>Harness</th><th>Subset</th></tr></thead>
+      <tbody>
+        {props.evals.map((e) => (
+          <tr>
+            <td>{byKey.get(e.task)?.name ?? e.task}</td>
+            <td>{e.metric}{e.filter && e.filter !== 'none' ? ` (${e.filter})` : ''}</td>
+            <td class="num">{num(e.value * 100, 1)}%</td>
+            <td class="num">{e.stderr != null ? `${num(e.stderr * 100, 1)}%` : DASH}</td>
+            <td class="num">{e.n_tasks ?? e.n_samples ?? DASH}</td>
+            <td class="num">{e.attempts_per_task ?? DASH}</td>
+            <td>{e.harness ?? DASH}{e.harness_version ? ` ${e.harness_version}` : ''}</td>
+            <td><code class="small">{e.subset_id ?? DASH}</code></td>
           </tr>
         ))}
       </tbody>

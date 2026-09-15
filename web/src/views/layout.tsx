@@ -19,6 +19,34 @@ export type ChartSpec = {
   }[];
 };
 
+/**
+ * Capability scoreboard description; public/scoreboard.js draws the SVG from it.
+ * The server-rendered capability table carries the same numbers for readers without JavaScript.
+ */
+export type ScoreboardSpec = {
+  categories: { key: string; name: string; weight: number }[];
+  benchmarks: { key: string; name: string; category: string; tier: string; size: string; shape: 'circle' | 'diamond' }[];
+  groups: { title: string; rows: ScoreboardRow[] }[];
+  /** What the speed bars mean, e.g. "Generation at 16k · t/s". */
+  speedLabel: string;
+};
+
+export type ScoreboardRow = {
+  name: string;
+  config: string;
+  rankLabel: string;
+  scores: Record<string, { value: number; stderr: number }>;
+  score: { value: number; stderr: number; categories: { key: string; name: string; weight: number; mean: number }[] } | null;
+  quick: { value: number; stderr: number; categories: { key: string; name: string; weight: number; mean: number }[] };
+  tieNote?: string;
+  speed?: number | null;
+  promptSpeed?: number | null;
+  allowance?: number | null;
+  allowanceText?: string;
+  issuesPerNight?: number | null;
+  vramGb?: number | null;
+};
+
 export type Tab = 'home' | 'benchmarks';
 
 const DEFAULT_DESCRIPTION =
@@ -34,6 +62,7 @@ export const Layout = (props: {
   description?: string;
   footer?: Child;
   charts?: boolean;
+  scoreboard?: boolean;
 }) => {
   const { publicOrigin, chatUrl } = siteConfig();
   const title = props.title.includes('Local Inference') ? props.title : `${props.title} · Local Inference`;
@@ -71,6 +100,7 @@ export const Layout = (props: {
               <script src="/static/charts.js" defer></script>
             </>
           )}
+          {props.scoreboard && <script src="/static/scoreboard.js" defer></script>}
         </body>
       </html>
     </>
@@ -86,6 +116,57 @@ export const Chart = (props: { id: string; title: string; subtitle?: string; spe
     <div class="chart-box" style={`height:${props.height ?? 280}px`}>
       <canvas data-chart={props.id} role="img" aria-label={props.title}></canvas>
     </div>
+    <script
+      type="application/json"
+      id={props.id}
+      dangerouslySetInnerHTML={{ __html: JSON.stringify(props.spec).replace(/</g, '\\u003c') }}
+    />
+  </figure>
+);
+
+const MARK = {
+  circle: <circle r="5" />,
+  diamond: <path d="M0 -6.5L6.5 0L0 6.5L-6.5 0Z" />,
+};
+
+/** The scoreboard figure: legend, the SVG the script draws, and the spec it reads. */
+export const Scoreboard = (props: { id: string; title: string; subtitle?: string; spec: ScoreboardSpec }) => (
+  <figure class="chart">
+    <figcaption>
+      <h3>{props.title}</h3>
+      {props.subtitle && <p class="muted">{props.subtitle}</p>}
+    </figcaption>
+    <div class="legend">
+      {props.spec.categories.map((cat) => (
+        <span class="lg">
+          <span class="lg-cat">{cat.name}</span>
+          {props.spec.benchmarks
+            .filter((b) => b.category === cat.key)
+            .map((b) => (
+              <>
+                <svg width="14" height="14" viewBox="-7 -7 14 14" aria-hidden="true" class={`c-${cat.key}`}>
+                  {MARK[b.shape]}
+                </svg>
+                <span>{b.name}</span>
+              </>
+            ))}
+        </span>
+      ))}
+      <span class="lg">
+        <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true">
+          <rect x="2" y="0" width="12" height="16" rx="2" class="ci" />
+          <rect x="6.5" y="0" width="3" height="16" rx="1.5" class="tick" />
+        </svg>
+        <span>Score ± 1 standard error</span>
+      </span>
+      <span class="lg">
+        <svg width="20" height="12" viewBox="0 0 20 12" aria-hidden="true">
+          <path d="M0 0H16Q20 0 20 4V8Q20 12 16 12H0Z" class="bar" />
+        </svg>
+        <span>{props.spec.speedLabel}</span>
+      </span>
+    </div>
+    <div class="board" data-scoreboard={props.id}></div>
     <script
       type="application/json"
       id={props.id}

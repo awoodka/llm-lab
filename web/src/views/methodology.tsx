@@ -74,6 +74,61 @@ export const Methodology = (props: { hardware: Record<string, any>[]; builds: Re
       </li>
     </ul>
 
+    <h2>Capability evals</h2>
+    <p>
+      Speed alone doesn't say whether a model can do the work, so each config is also scored on what it solves. Every
+      benchmark runs against the config's own server, with its own settings, and reports the percent of tasks solved with
+      a standard error.
+    </p>
+    <ul>
+      <li>
+        <strong>Quick tier</strong>, run for every config: LiveCodeBench (100 problems), BFCL (400 cases), GPQA Diamond
+        (198 questions) and AIME 2025 (30 problems, 4 attempts each). Each task gets 5 minutes.
+      </li>
+      <li>
+        <strong>Deep tier</strong>, run only for configs worth the overnight time: SWE-bench Verified (30 issues, solved
+        by an agent) and Terminal-Bench (30 tasks). Each task gets 20 minutes and runs alone.
+      </li>
+      <li>Only configs with all six benchmarks are ranked. The rest are listed by their quick-tier score.</li>
+      <li>
+        Benchmarks run with thinking turned off, so the numbers are comparable between models. Chat itself runs with
+        thinking on.
+      </li>
+      <li>
+        Code written by a model during a benchmark runs inside a container with no network access, never on the machine
+        itself.
+      </li>
+      <li>
+        The protocol and prompt set are adapted from{' '}
+        <a href="https://github.com/syv-ai/qwen38-27b-rtx3090">syv-ai/qwen38-27b-rtx3090</a> (Apache-2.0).
+      </li>
+    </ul>
+
+    <h2>The thinking allowance</h2>
+    <p>
+      Speed matters here because it buys reasoning, not because a fast answer is worth more. Each task gives a config a
+      token budget instead of a stopwatch: what it could generate within the time limit at its own measured speed, after
+      reading the prompt.
+    </p>
+    <ul>
+      <li>Allowance = (time limit − time to read the prompt) × generation speed at that prompt's depth, capped by the context left.</li>
+      <li>Both figures come from the config's published speed run, so the budget is fixed before the benchmark starts and never drifts with load.</li>
+      <li>Thinking tokens count against it. An answer that doesn't finish inside its allowance is wrong.</li>
+      <li>A faster config gets more room to think in the same 5 minutes; a model that finishes early gains nothing from extra speed.</li>
+    </ul>
+
+    <h2>The coding-work score</h2>
+    <ul>
+      <li>Coding counts 50%, agents and tools 30%, reasoning 20%.</li>
+      <li>
+        A category's score is the mean of its benchmarks, and the total combines the three as a weighted geometric mean, so
+        being weak in one area pulls the score down rather than averaging out.
+      </li>
+      <li>The ± figure is one standard error, carried through from each benchmark's own error.</li>
+      <li>Configs whose scores are within one combined standard error share a rank, shown as "=2".</li>
+      <li>Issues fixed per night = 8 hours ÷ the average time per SWE-bench issue × the share it resolved.</li>
+    </ul>
+
     <h2>Throttling</h2>
     <p>
       A run is flagged as throttled if the GPU reports hardware slowdown, thermal slowdown or a hardware power brake at any
@@ -91,8 +146,15 @@ export const Methodology = (props: { hardware: Record<string, any>[]; builds: Re
     <h2>What these numbers don't show</h2>
     <ul>
       <li>They describe this one machine, not every RTX 3090.</li>
-      <li>They measure one request at a time with synthetic prompts, not multi-user serving throughput or end-to-end chat latency.</li>
-      <li>Output quality (perplexity, KL divergence) and task evals aren't measured yet.</li>
+      <li>Speed runs measure one request at a time with synthetic prompts, not multi-user serving throughput.</li>
+      <li>
+        The benchmarks are small and use fixed subsets: 30 tasks carry roughly ±9 points of error near 50%, which is what
+        the error bars and shared ranks are for.
+      </li>
+      <li>Each config is benchmarked with one sampling setup, the one it serves chat with. Another setting might score differently.</li>
+      <li>Models may have seen these public benchmarks during training, which would flatter them.</li>
+      <li>Only configs worth the overnight time get the deep tier, so most are ranked on the quick tier alone.</li>
+      <li>Output quality (perplexity, KL divergence) isn't measured yet.</li>
     </ul>
   </article>
 );
