@@ -51,6 +51,10 @@ def publish(rd: RunDir, dry_run: bool = False, replace: bool = False) -> dict:
     bundle = rd.load()
     if bundle.run.status != "ok":
         raise PublishError(f"run {rd.path.name} has status {bundle.run.status!r}; only ok runs can be published")
+    if bundle.run.raw.get("limited"):
+        raise PublishError(
+            f"run {rd.path.name} ran a --limit subset; it is a smoke test, not the pinned benchmark, so it stays local"
+        )
     payload = bundle.model_dump(mode="json")
     payload["bundle_sha"] = bundle.content_sha()
     check_no_local_paths(payload)

@@ -258,6 +258,64 @@ def bench(
     typer.echo(f"\nrun saved: {rd.path}\npublish with: lab publish {rd.path.name}")
 
 
+# -- evals -------------------------------------------------------------------
+@app.command("eval")
+def eval_cmd(
+    ref: str,
+    tier: str = typer.Option("quick", help="quick (every config) or deep (configs worth a night each)"),
+    benchmarks: str | None = typer.Option(None, help="Comma-separated subset of the tier, e.g. aime_2025,gpqa_diamond"),
+    limit: int | None = typer.Option(None, help="First N tasks of each benchmark: a smoke test, never publishable"),
+    attempts: int | None = typer.Option(None, help="Override attempts per task (AIME uses 4)"),
+    parallel: int = typer.Option(1, help="Requests in flight; the server is relaunched with -np N and N× the context"),
+    resume: str | None = typer.Option(None, help="Continue a run: its id or directory name"),
+    stop_at: str | None = typer.Option(None, "--stop-at", help="End the sitting cleanly at HH:MM local time"),
+    wait: bool = typer.Option(False, help="Queue behind a held GPU lock instead of failing"),
+    keep_paused: bool = typer.Option(False, help="Leave the hosted model stopped afterwards"),
+    unpublished_speed: bool = typer.Option(False, help="Size allowances from a local speed run that isn't published yet"),
+) -> None:
+    """Run capability benchmarks against a config. Chat pauses while they run; publish separately."""
+    from lab.evals.runner import run_evals, summarise
+
+    if tier not in ("quick", "deep"):
+        _fail(f"--tier is quick or deep, not {tier!r}")
+    _check_power()
+    rd = run_evals(
+        ref,
+        tier=tier,
+        benchmark_keys=[b.strip() for b in benchmarks.split(",")] if benchmarks else None,
+        limit=limit,
+        attempts_override=attempts,
+        parallel=parallel,
+        resume=resume,
+        stop_at=stop_at,
+        wait=wait,
+        keep_paused=keep_paused,
+        published_speed_only=not unpublished_speed,
+        cli_args=_cli_args(),
+    )
+    typer.echo("\n" + summarise(rd))
+    bundle = rd.load()
+    typer.echo(f"\nrun saved: {rd.path}")
+    if bundle.run.status != "ok":
+        typer.echo(f"resume with: lab eval {ref} --tier {tier} --resume {rd.path.name}")
+    elif bundle.run.raw.get("limited"):
+        typer.echo("smoke test over a --limit subset: it stays local, since it is not the pinned benchmark")
+    else:
+        typer.echo(f"publish with: lab publish {rd.path.name}")
+
+
+@app.command("eval-pin")
+def eval_pin(benchmark: str, force: bool = typer.Option(False, help="Rewrite a pin that already exists")) -> None:
+    """Pin a benchmark's task list, so later runs are comparable with earlier ones."""
+    from lab.evals.drivers import get_driver
+    from lab.evals.drivers.base import subset_file, write_pin
+
+    if subset_file(benchmark).is_file() and not force:
+        _fail(f"{subset_file(benchmark)} already exists; pass --force to rewrite it (results before and after stop being comparable)")
+    subset = get_driver(benchmark).subset()
+    typer.echo(f"wrote {write_pin(benchmark, subset)} — {len(subset.tasks)} tasks, {subset.id}")
+
+
 # -- runs --------------------------------------------------------------------
 def _print_run(rd: store.RunDir) -> None:
     b = rd.load()
@@ -266,6 +324,8 @@ def _print_run(rd: store.RunDir) -> None:
     typer.echo(f"  {b.model.slug} / {b.config.slug}  engine {b.engine_build.engine}@{b.engine_build.commit_sha}")
     if r.error:
         typer.secho(f"  error: {r.error}", fg="red")
+    for e in b.eval_results:
+        typer.echo(f"  {e.task:<20} {e.value:>7.1%} ± {(e.stderr or 0):.1%}  n={e.n_tasks}  {e.subset_id}")
     for m in b.metrics:
         dims = f"p{m.n_prompt} g{m.n_gen} d{m.depth}"
         sd = f" ± {m.stddev:.2f}" if m.stddev is not None else ""

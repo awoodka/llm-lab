@@ -5,6 +5,7 @@ from pathlib import Path
 
 ROOT = Path(os.environ.get("LAB_ROOT", Path(__file__).resolve().parents[2]))
 CATALOG = ROOT / "catalog"
+SUBSETS = ROOT / "subsets"  # committed eval subsets: which task ids a benchmark is pinned to
 RUNS = ROOT / "runs"
 STATE = ROOT / "state"
 GPU_LOCK = STATE / "gpu.lock"

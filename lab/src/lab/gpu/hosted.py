@@ -126,7 +126,7 @@ def _report_pause(paused: bool, purpose: str = "") -> None:
         from lab.publish import put_pause
 
         words = purpose.split()
-        reason = words[0] if words and words[0] in ("bench", "serve") else None
+        reason = words[0] if words and words[0] in ("bench", "serve", "evals") else None
         ref = next((w for w in words if "/" in w), None)
         put_pause(paused, reason if paused else None, ref if paused else None)
     except Exception:  # noqa: BLE001

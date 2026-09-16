@@ -87,7 +87,8 @@ def start_run(
     return RunContext(rd, bundle, time.monotonic())
 
 
-def finish_ok(ctx: RunContext, metrics: list[Metric], tel: Telemetry | None, raw: dict | None = None) -> None:
+def finish_ok(ctx: RunContext, metrics: list[Metric], tel: Telemetry | None, raw: dict | None = None,
+              telemetry_every_s: float = 1.0) -> None:
     run = ctx.bundle.run
     ctx.bundle.metrics = metrics
     run.status = "ok"
@@ -95,7 +96,7 @@ def finish_ok(ctx: RunContext, metrics: list[Metric], tel: Telemetry | None, raw
     if tel is not None:
         summary = tel.summary()
         run.throttled = summary["throttled"]
-        run.telemetry = tel.downsampled()
+        run.telemetry = tel.downsampled(telemetry_every_s)
         run.raw["telemetry_summary"] = summary
     if raw:
         run.raw.update(raw)

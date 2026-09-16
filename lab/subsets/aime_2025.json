@@ -1,0 +1,43 @@
+{
+  "name": "aime_2025_full",
+  "source": {
+    "repo": "opencompass/AIME2025",
+    "revision": "a6ad95f611d72cf628a80b58bd0432ef6638f958",
+    "files": [
+      "aime2025-I.jsonl",
+      "aime2025-II.jsonl"
+    ]
+  },
+  "task_ids": [
+    "aime_2025/I-1",
+    "aime_2025/I-2",
+    "aime_2025/I-3",
+    "aime_2025/I-4",
+    "aime_2025/I-5",
+    "aime_2025/I-6",
+    "aime_2025/I-7",
+    "aime_2025/I-8",
+    "aime_2025/I-9",
+    "aime_2025/I-10",
+    "aime_2025/I-11",
+    "aime_2025/I-12",
+    "aime_2025/I-13",
+    "aime_2025/I-14",
+    "aime_2025/I-15",
+    "aime_2025/II-1",
+    "aime_2025/II-2",
+    "aime_2025/II-3",
+    "aime_2025/II-4",
+    "aime_2025/II-5",
+    "aime_2025/II-6",
+    "aime_2025/II-7",
+    "aime_2025/II-8",
+    "aime_2025/II-9",
+    "aime_2025/II-10",
+    "aime_2025/II-11",
+    "aime_2025/II-12",
+    "aime_2025/II-13",
+    "aime_2025/II-14",
+    "aime_2025/II-15"
+  ]
+}
