@@ -92,16 +92,12 @@ export const Methodology = (props: { hardware: Record<string, any>[]; builds: Re
       <li>Only configs with all six benchmarks are ranked. The rest are listed by their quick-tier score.</li>
       <li>
         Each config is evaluated exactly as it serves chat, including thinking where it has it. Thinking tokens come out
-        of the allowance, so reasoning is paid for rather than free. The speed benchmarks are the ones that turn thinking
-        off, because there it would only add tokens to time.
+        of the allowance, so reasoning is paid for rather than free. Speed runs don't involve thinking at all: llama-bench
+        times fixed token counts without a chat template.
       </li>
       <li>
         Code written by a model during a benchmark runs inside a container with no network access, never on the machine
         itself.
-      </li>
-      <li>
-        The protocol and prompt set are adapted from{' '}
-        <a href="https://github.com/syv-ai/qwen38-27b-rtx3090">syv-ai/qwen38-27b-rtx3090</a> (Apache-2.0).
       </li>
     </ul>
 
