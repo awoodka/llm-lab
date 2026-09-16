@@ -91,8 +91,9 @@ export const Methodology = (props: { hardware: Record<string, any>[]; builds: Re
       </li>
       <li>Only configs with all six benchmarks are ranked. The rest are listed by their quick-tier score.</li>
       <li>
-        Benchmarks run with thinking turned off, so the numbers are comparable between models. Chat itself runs with
-        thinking on.
+        Each config is evaluated exactly as it serves chat, including thinking where it has it. Thinking tokens come out
+        of the allowance, so reasoning is paid for rather than free. The speed benchmarks are the ones that turn thinking
+        off, because there it would only add tokens to time.
       </li>
       <li>
         Code written by a model during a benchmark runs inside a container with no network access, never on the machine
