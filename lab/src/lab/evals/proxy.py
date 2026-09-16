@@ -10,7 +10,13 @@ request lands in one log. Two rules the proxy keeps:
   it, and a request that ends on `length` is an unfinished answer, which the benchmark scores as wrong.
 
 Prompt tokens are counted the way the server itself counts them: render the chat template, then
-tokenize it. Verified against llama-server b10883: computed count == reported `usage.prompt_tokens`.
+tokenize it with special tokens added. `/apply-template` leaves out the BOS a model like Gemma 3 needs
+and the server adds it back when it tokenizes, so the count must too. Verified against llama-server
+b10883 on Qwen3.8 (no BOS) and Gemma 3 (BOS): computed count == reported `usage.prompt_tokens`. Every
+answer is checked against that report, and a disagreement is logged and counted rather than trusted.
+
+Each answer carries `x-lab-prompt-tokens` and `x-lab-allowance` headers, so a harness records the size
+that was actually enforced.
 """
 
 import json
@@ -89,6 +95,8 @@ class AllowanceProxy:
         self.allowance = allowance
         self.stats = ProxyStats()
         self.current_task = "unknown"
+        #: Answers whose server-reported prompt size differed from the proxy's count.
+        self.count_mismatches = 0
         self._lock = threading.Lock()
         self._log = open(log_path, "a", buffering=1) if log_path else None  # noqa: SIM115 - closed in stop()
         # No read timeout: one answer may legitimately take the whole task limit.
@@ -145,7 +153,7 @@ class AllowanceProxy:
         rendered.raise_for_status()
         tokens = self._client.post(
             f"{self.upstream}/tokenize",
-            json={"content": rendered.json()["prompt"], "add_special": False},
+            json={"content": rendered.json()["prompt"], "add_special": True},
         )
         tokens.raise_for_status()
         return len(tokens.json()["tokens"])
@@ -160,6 +168,10 @@ class AllowanceProxy:
 
     def record(self, task: str, entry: dict[str, Any]) -> None:
         with self._lock:
+            reported = entry.get("server_prompt_tokens")
+            if reported is not None and reported != entry.get("prompt_tokens"):
+                entry["count_mismatch"] = True
+                self.count_mismatches += 1
             self.stats.for_task(task).add(
                 prompt=entry.get("prompt_tokens") or 0,
                 completion=entry.get("completion_tokens") or 0,
@@ -204,11 +216,13 @@ def _make_handler(proxy: AllowanceProxy) -> type[BaseHTTPRequestHandler]:
             pass
 
         # -- plumbing ----------------------------------------------------------
-        def _send(self, status: int, payload: Any, content_type: str = "application/json") -> None:
+        def _send(self, status: int, payload: Any, content_type: str = "application/json", headers: dict[str, str] | None = None) -> None:
             body = payload if isinstance(payload, bytes) else json.dumps(payload).encode()
             self.send_response(status)
             self.send_header("content-type", content_type)
             self.send_header("content-length", str(len(body)))
+            for k, v in (headers or {}).items():
+                self.send_header(k, v)
             self.end_headers()
             self.wfile.write(body)
 
@@ -251,6 +265,7 @@ def _make_handler(proxy: AllowanceProxy) -> type[BaseHTTPRequestHandler]:
                 return
 
             allowance = proxy.allowance.for_prompt(prompt_tokens)
+            sized_headers = {"x-lab-prompt-tokens": str(prompt_tokens), "x-lab-allowance": str(allowance)}
             entry = {
                 "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                 "task": task,
@@ -260,22 +275,22 @@ def _make_handler(proxy: AllowanceProxy) -> type[BaseHTTPRequestHandler]:
             if allowance <= 0:
                 entry.update(completion_tokens=0, finish_reason="length", seconds=time.monotonic() - started, no_allowance=True)
                 proxy.record(task, entry)
-                self._send(200, _no_allowance_response(body.get("model", "lab"), prompt_tokens))
+                self._send(200, _no_allowance_response(body.get("model", "lab"), prompt_tokens), headers=sized_headers)
                 return
 
             sized = proxy.sized_body(body, allowance)
             try:
                 if sized.get("stream"):
-                    self._stream(sized, entry, task, started)
+                    self._stream(sized, entry, task, started, sized_headers)
                 else:
-                    self._complete(sized, entry, task, started)
+                    self._complete(sized, entry, task, started, sized_headers)
             except httpx.HTTPError as e:
                 entry.update(error=str(e), seconds=time.monotonic() - started)
                 proxy.record(task, entry)
                 self._error(502, f"upstream failed: {e}")
 
         # -- the two shapes of an answer ---------------------------------------
-        def _complete(self, sized: dict[str, Any], entry: dict[str, Any], task: str, started: float) -> None:
+        def _complete(self, sized: dict[str, Any], entry: dict[str, Any], task: str, started: float, headers: dict[str, str]) -> None:
             r = proxy._client.post(f"{proxy.upstream}/v1/chat/completions", json=sized)
             entry["seconds"] = round(time.monotonic() - started, 3)
             if r.status_code >= 400:
@@ -287,6 +302,7 @@ def _make_handler(proxy: AllowanceProxy) -> type[BaseHTTPRequestHandler]:
             usage = data.get("usage") or {}
             timings = data.get("timings") or {}
             entry.update(
+                server_prompt_tokens=usage.get("prompt_tokens"),
                 completion_tokens=usage.get("completion_tokens", 0),
                 finish_reason=(data.get("choices") or [{}])[0].get("finish_reason"),
                 cached_tokens=(usage.get("prompt_tokens_details") or {}).get("cached_tokens"),
@@ -294,9 +310,9 @@ def _make_handler(proxy: AllowanceProxy) -> type[BaseHTTPRequestHandler]:
                 prompt_per_second=timings.get("prompt_per_second"),
             )
             proxy.record(task, entry)
-            self._send(200, data)
+            self._send(200, data, headers=headers)
 
-        def _stream(self, sized: dict[str, Any], entry: dict[str, Any], task: str, started: float) -> None:
+        def _stream(self, sized: dict[str, Any], entry: dict[str, Any], task: str, started: float, headers: dict[str, str]) -> None:
             """Relay the SSE bytes untouched, reading usage out of the final chunks as they pass."""
             chunks: list[dict[str, Any]] = []
             with proxy._client.stream("POST", f"{proxy.upstream}/v1/chat/completions", json=sized) as r:
@@ -310,6 +326,8 @@ def _make_handler(proxy: AllowanceProxy) -> type[BaseHTTPRequestHandler]:
                 self.send_header("content-type", "text/event-stream")
                 self.send_header("cache-control", "no-cache")
                 self.send_header("connection", "close")
+                for k, v in headers.items():
+                    self.send_header(k, v)
                 self.end_headers()
                 self.close_connection = True
                 for line in r.iter_lines():
@@ -323,6 +341,7 @@ def _make_handler(proxy: AllowanceProxy) -> type[BaseHTTPRequestHandler]:
                             pass
             usage, finish = _usage_from_stream(chunks)
             entry.update(
+                server_prompt_tokens=usage.get("prompt_tokens"),
                 completion_tokens=usage.get("completion_tokens", 0),
                 finish_reason=finish,
                 seconds=round(time.monotonic() - started, 3),

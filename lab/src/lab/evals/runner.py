@@ -33,7 +33,7 @@ from lab.evals.drivers import get_driver
 from lab.evals.drivers.base import Subset, Task, check_against_pin
 from lab.evals.proxy import AllowanceProxy
 from lab.evals.registry import Benchmark
-from lab.evals.session import Attempt, Checkpoint, metrics, progress, score
+from lab.evals.session import Attempt, Checkpoint, counted, excluded_tasks, metrics, progress, score
 from lab.gpu.hosted import exclusive_gpu
 from lab.schema import EvalResult, Metric
 from lab.store import RunDir, find_run
@@ -122,8 +122,12 @@ class EvalSession:
             self.stopping = True
             raise StopRequested
 
-    def answer(self, bench: Benchmark, task: Task, attempt: int) -> Attempt:
-        """One request through the proxy, graded. Infrastructure failures are retried, then excluded."""
+    def answer(self, bench: Benchmark, task: Task, attempt: int) -> tuple[Attempt, dict[str, Any]]:
+        """One request through the proxy, graded, plus the reply it was graded on.
+
+        Infrastructure failures are retried, then excluded. Only `content` is graded: a model's thinking
+        (`reasoning_content`) is kept for the transcript but never read for an answer.
+        """
         driver = get_driver(bench.key)
         record = Attempt(benchmark=bench.key, task=task.id, attempt=attempt)
         body = {"model": self.model_name, "messages": task.messages, **task.request}
@@ -141,9 +145,10 @@ class EvalSession:
                     time.sleep(5)
                     continue
                 record.excluded = True
-                return record
+                return record, {}
             choice = (data.get("choices") or [{}])[0]
-            text = (choice.get("message") or {}).get("content") or ""
+            message = choice.get("message") or {}
+            text = message.get("content") or ""
             usage = data.get("usage") or {}
             outcome = driver.grade(task, text)
             record.error = None
@@ -154,11 +159,13 @@ class EvalSession:
             record.prompt_tokens = usage.get("prompt_tokens") or 0
             record.completion_tokens = usage.get("completion_tokens") or 0
             record.finish_reason = choice.get("finish_reason")
-            record.allowance = self.proxy.allowance.for_prompt(record.prompt_tokens)
+            # The size the proxy enforced, not a recomputation from the server's count.
+            record.allowance = int(r.headers.get("x-lab-allowance") or self.proxy.allowance.for_prompt(record.prompt_tokens))
             # An answer that ran out of allowance is unfinished, which the benchmark scores as wrong.
             if record.finish_reason == "length":
                 record.passed = False
-            return record
+            reply = {k: message[k] for k in ("reasoning_content", "content", "tool_calls") if message.get(k)}
+            return record, reply
         raise AssertionError("unreachable")
 
     def run_benchmark(self, bench: Benchmark, subset: Subset, attempts: int, parallel: int, transcripts) -> None:
@@ -168,18 +175,21 @@ class EvalSession:
             for attempt in range(1, attempts + 1)
             if not self.checkpoint.has(bench.key, task.id, attempt)
         ]
+        excluded = excluded_tasks(self.checkpoint.for_benchmark(bench.key))
         if not jobs:
             return
 
         def work(job: tuple[Task, int]) -> None:
             task, attempt = job
+            if task.id in excluded:
+                return  # already out of the score; more attempts would only spend time
             self.check_deadline()
-            record = self.answer(bench, task, attempt)
+            record, reply = self.answer(bench, task, attempt)
             with self.lock:
                 self.checkpoint.add(record)
-                transcripts(bench, task, attempt, record)
+                transcripts(bench, task, attempt, record, reply)
                 if record.excluded:
-                    self.checkpoint.exclude_task(bench.key, task.id)
+                    excluded.add(task.id)
                     print(f"  excluded {task.id}: {record.error}", file=sys.stderr)
 
         if parallel <= 1:
@@ -258,6 +268,10 @@ def run_evals(
                         finally:
                             print("  " + progress(bench, checkpoint.for_benchmark(bench.key), len(subsets[bench.key].tasks)), file=sys.stderr)
                     stats = {task: vars(s) for task, s in proxy.stats.tasks.items()}
+                    count_mismatches = proxy.count_mismatches
+                    if count_mismatches:
+                        print(f"  warning: {count_mismatches} answer(s) where the server counted the prompt differently "
+                              f"from the proxy; see count_mismatch in {rd.logs / 'requests.jsonl'}", file=sys.stderr)
             finally:
                 server.stop()
                 tel.stop()
@@ -278,7 +292,9 @@ def run_evals(
         allowance=allowance.as_raw(),
         props=props,
         subsets={k: {"id": s.id, "name": s.name, "source": s.source, "n_tasks": len(s.tasks)} for k, s in subsets.items()},
-        proxy_stats=stats,
+        # Across sittings: an attempt re-asked after an interruption replaces its earlier entry.
+        proxy_stats={**(bundle.run.raw.get("proxy_stats") or {}), **stats},
+        proxy_count_mismatches=(bundle.run.raw.get("proxy_count_mismatches") or 0) + count_mismatches,
         parallel=parallel,
         limited=bool(limit),
         launch_overrides={"parallel": parallel, "ctx": launch_cfg.params.ctx} if parallel > 1 else {},
@@ -326,14 +342,18 @@ def _ctx(rd: RunDir, bundle, t0: float):
 
 
 def _transcript_writer(rd: RunDir):
-    """Every answer is kept on disk: the plan's checkpoint is reading a few before anything is published."""
+    """Every answer is kept on disk: the plan's checkpoint is reading a few before anything is published.
+
+    `messages` is what was sent and `reply` what came back, thinking included, so a grade can be checked
+    by reading exactly what the grader read.
+    """
     path = rd.raw / "transcripts.jsonl"
 
-    def write(bench: Benchmark, task: Task, attempt: int, record: Attempt) -> None:
+    def write(bench: Benchmark, task: Task, attempt: int, record: Attempt, reply: dict[str, Any]) -> None:
         with open(path, "a", buffering=1) as fh:
             fh.write(json.dumps({
                 "benchmark": bench.key, "task": task.id, "attempt": attempt,
-                "messages": task.messages, "expected": task.answer,
+                "messages": task.messages, "reply": reply, "expected": task.answer,
                 "extracted": record.extracted, "passed": record.passed,
                 "finish_reason": record.finish_reason, "completion_tokens": record.completion_tokens,
             }) + "\n")
@@ -353,7 +373,7 @@ def _save_progress(rd: RunDir, bundle, checkpoint: Checkpoint, session_started: 
     bundle.run.raw["sessions"] = sessions
     bundle.run.raw["progress"] = {
         b.key: {
-            "done": len({a.task for a in checkpoint.for_benchmark(b.key) if not a.excluded}),
+            "done": len({a.task for a in counted(checkpoint.for_benchmark(b.key))}),
             "planned": len(subsets[b.key].tasks),
         }
         for b in benches

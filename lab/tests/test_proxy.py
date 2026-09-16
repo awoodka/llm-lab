@@ -12,18 +12,36 @@ import httpx
 import pytest
 
 from lab.evals.allowance import Allowance, SpeedPoint
+from lab.evals.drivers.base import Task
 from lab.evals.proxy import AllowanceProxy
+from lab.evals.registry import BY_KEY
+from lab.evals.runner import EvalSession
 
 QWEN = Allowance(ctx=65536, pp0=949, tg=[SpeedPoint(0, 31.8), SpeedPoint(4096, 30.9), SpeedPoint(16384, 28.2)], limit_s=300, speed_run_id="run-1")
 
 
 class FakeServer:
-    """A llama-server stand-in: one token per word, and an answer that stops on the size it was given."""
+    """A llama-server stand-in: one token per word, and an answer that stops on the size it was given.
+
+    With `bos`, it behaves like Gemma 3: the rendered template has no BOS and tokenizing with special
+    tokens adds one, as the server does to every chat prompt. `misreport` skews the count it reports.
+    """
 
     def __init__(self):
         self.seen: list[dict] = []
         self.fail_with: int | None = None
+        self.bos = False
+        self.misreport = 0
         proxy_self = self
+
+        def render(body) -> str:
+            text = " ".join(m["content"] for m in body["messages"])
+            if body.get("tools"):
+                text += " " + " ".join(["tooldef"] * 10)
+            return text
+
+        def tokens(text: str, add_special: bool) -> list[int]:
+            return ([2] if add_special and proxy_self.bos else []) + list(range(10, 10 + len(text.split())))
 
         class Handler(BaseHTTPRequestHandler):
             protocol_version = "HTTP/1.1"
@@ -45,28 +63,28 @@ class FakeServer:
             def do_POST(self):  # noqa: N802
                 body = json.loads(self.rfile.read(int(self.headers["content-length"])) or b"{}")
                 if self.path == "/apply-template":
-                    text = " ".join(m["content"] for m in body["messages"])
-                    if body.get("tools"):
-                        text += " " + " ".join(["tooldef"] * 10)
-                    return self._json(200, {"prompt": text})
+                    return self._json(200, {"prompt": render(body)})
                 if self.path == "/tokenize":
-                    return self._json(200, {"tokens": list(range(len(body["content"].split())))})
+                    return self._json(200, {"tokens": tokens(body["content"], body.get("add_special", False))})
                 proxy_self.seen.append(body)
+                prompt = len(tokens(render(body), True)) + proxy_self.misreport
                 if proxy_self.fail_with:
                     return self._json(proxy_self.fail_with, {"error": "upstream said no"})
                 asked = body["max_tokens"]
                 # Long allowances finish; short ones run out, which is what a length stop means.
                 completion, finish = (12, "stop") if asked > 100 else (asked, "length")
                 if body.get("stream"):
-                    return self._stream(completion, finish)
+                    return self._stream(prompt, completion, finish)
+                # Thinking arrives apart from the answer, as llama-server sends it with a reasoning format.
+                message = {"role": "assistant", "reasoning_content": "maybe \\boxed{70}", "content": "\\boxed{12}"}
                 return self._json(200, {
                     "id": "chatcmpl-1", "model": "fake",
-                    "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"}, "finish_reason": finish}],
-                    "usage": {"prompt_tokens": 7, "completion_tokens": completion, "prompt_tokens_details": {"cached_tokens": 3}},
+                    "choices": [{"index": 0, "message": message, "finish_reason": finish}],
+                    "usage": {"prompt_tokens": prompt, "completion_tokens": completion, "prompt_tokens_details": {"cached_tokens": 3}},
                     "timings": {"predicted_per_second": 30.5, "prompt_per_second": 900.0},
                 })
 
-            def _stream(self, completion, finish):
+            def _stream(self, prompt, completion, finish):
                 self.send_response(200)
                 self.send_header("content-type", "text/event-stream")
                 self.send_header("connection", "close")
@@ -74,7 +92,7 @@ class FakeServer:
                 self.close_connection = True
                 for piece in ({"choices": [{"delta": {"content": "ok"}}]},
                               {"choices": [{"delta": {}, "finish_reason": finish}]},
-                              {"choices": [], "usage": {"prompt_tokens": 7, "completion_tokens": completion}}):
+                              {"choices": [], "usage": {"prompt_tokens": prompt, "completion_tokens": completion}}):
                     self.wfile.write(f"data: {json.dumps(piece)}\n\n".encode())
                 self.wfile.write(b"data: [DONE]\n\n")
                 self.wfile.flush()
@@ -182,6 +200,8 @@ def test_streaming_relays_the_chunks_and_still_records_usage(proxy):
     ) as r:
         body = "".join(r.iter_text())
     assert "data: [DONE]" in body
+    assert r.headers["x-lab-allowance"], "sized before the first byte, so a streaming harness can record it too"
+    assert proxy.count_mismatches == 0
     stats = proxy.stats.for_task("lcb:7")
     assert stats.requests == 1 and stats.completion_tokens == 12 and stats.length_stops == 0
 
@@ -197,3 +217,32 @@ def test_health_and_models_pass_through(proxy):
     assert httpx.get(f"http://127.0.0.1:{proxy.port}/health", timeout=10).json() == {"status": "ok"}
     assert httpx.get(f"{proxy.base_url}/models", timeout=10).status_code == 200
     assert httpx.post(f"{proxy.base_url}/embeddings", json={}, timeout=10).status_code == 404
+
+
+def test_a_bos_the_template_leaves_out_is_counted_the_way_the_server_counts_it(proxy, upstream):
+    upstream.bos = True
+    r = chat(proxy, words=8000)
+    assert r.headers["x-lab-prompt-tokens"] == "8001", "Gemma's BOS is part of the prompt the model sees"
+    assert int(r.headers["x-lab-allowance"]) == upstream.seen[-1]["max_tokens"]
+    assert proxy.count_mismatches == 0
+
+
+def test_a_count_the_server_disagrees_with_is_logged_not_trusted(proxy, upstream, tmp_path):
+    upstream.misreport = 1
+    chat(proxy, words=100, task="aime:2")
+    assert proxy.count_mismatches == 1
+    line = json.loads((tmp_path / "requests.jsonl").read_text().splitlines()[-1])
+    assert line["count_mismatch"] is True
+    assert (line["prompt_tokens"], line["server_prompt_tokens"]) == (100, 101)
+
+
+def test_the_runner_keeps_the_reply_it_graded_and_the_allowance_it_was_given(proxy, upstream):
+    upstream.bos = True
+    session = EvalSession(proxy, checkpoint=None, model_name="m", deadline=None, request_timeout=30)
+    task = Task(id="aime_2025/I-1", messages=[{"role": "user", "content": " ".join(["word"] * 100)}], answer="70")
+    record, reply = session.answer(BY_KEY["aime_2025"], task, 1)
+
+    assert reply == {"reasoning_content": "maybe \\boxed{70}", "content": "\\boxed{12}"}, "the transcript holds both"
+    assert (record.extracted, record.passed) == ("12", False), "only the answer is graded, never the thinking"
+    assert record.prompt_tokens == 101
+    assert record.allowance == upstream.seen[-1]["max_tokens"], "the size that was enforced, not a recomputation"

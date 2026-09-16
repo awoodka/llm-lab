@@ -78,10 +78,26 @@ def test_a_checkpoint_survives_a_stopped_sitting(tmp_path):
     assert resumed.has("aime_2025", "t1", 1)
     assert not resumed.has("aime_2025", "t1", 2), "an unfinished attempt is run again"
     assert resumed.attempts[("aime_2025", "t1", 1)].seconds == 4
-    resumed.exclude_task("aime_2025", "t1")
-    assert all(a.excluded for a in resumed.for_task("aime_2025", "t1"))
     resumed.close()
     assert len(path.read_text().splitlines()) == 2
+
+
+def test_a_resumed_run_excludes_exactly_what_an_unbroken_one_would(tmp_path):
+    # t0 answered once, then hit an infrastructure failure: the whole task is out, not just that attempt.
+    records = [attempt("t0", 1, True), attempt("t0", 2, False, excluded=True, error="ConnectError")]
+    records += [attempt(f"t{i}", n, n == 1) for i in range(1, 10) for n in (1, 2)]
+    path = tmp_path / "attempts.jsonl"
+    first = Checkpoint(path)
+    for r in records:
+        first.add(r)
+    first.close()
+
+    kw = dict(subset_id="s:1", harness_version="v", n_planned=10)
+    unbroken = score(AIME, records, **kw)
+    resumed = score(AIME, Checkpoint(path).for_benchmark(AIME.key), **kw)
+    assert unbroken == resumed
+    assert unbroken.n_tasks == 9 and unbroken.n_samples == 18 and unbroken.value == 0.5
+    assert {m.key: m.value for m in metrics(AIME, records, quick=True)}["eval_excluded"] == 1
 
 
 def test_stop_at_is_the_next_time_that_clock_reads(monkeypatch):

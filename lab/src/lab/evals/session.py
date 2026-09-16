@@ -61,27 +61,33 @@ class Checkpoint:
         self.attempts[a.key] = a
         self._fh.write(json.dumps(asdict(a)) + "\n")
 
-    def exclude_task(self, benchmark: str, task: str) -> None:
-        """Drop every attempt at a task that kept failing for reasons the model isn't responsible for."""
-        for a in self.for_task(benchmark, task):
-            a.excluded = True
-
     def for_benchmark(self, key: str) -> list[Attempt]:
         return [a for a in self.attempts.values() if a.benchmark == key]
-
-    def for_task(self, key: str, task: str) -> list[Attempt]:
-        return [a for a in self.attempts.values() if a.benchmark == key and a.task == task]
 
     def close(self) -> None:
         self._fh.close()
 
 
+def excluded_tasks(attempts: list[Attempt]) -> set[str]:
+    """Tasks with an attempt that kept failing for reasons the model isn't responsible for."""
+    return {a.task for a in attempts if a.excluded}
+
+
+def counted(attempts: list[Attempt]) -> list[Attempt]:
+    """The attempts a score is built from: every attempt at a task that wasn't excluded.
+
+    Worked out from the records each time rather than marked on them, so a resumed run, which reads the
+    checkpoint back from disk, excludes exactly what an unbroken run would.
+    """
+    excluded = excluded_tasks(attempts)
+    return [a for a in attempts if a.task not in excluded]
+
+
 def task_scores(attempts: list[Attempt]) -> dict[str, float]:
-    """Per task: the share of its attempts that passed. Excluded attempts don't count either way."""
+    """Per task: the share of its attempts that passed. Excluded tasks don't count either way."""
     by_task: dict[str, list[Attempt]] = {}
-    for a in attempts:
-        if not a.excluded:
-            by_task.setdefault(a.task, []).append(a)
+    for a in counted(attempts):
+        by_task.setdefault(a.task, []).append(a)
     return {task: statistics.fmean(a.passed for a in xs) for task, xs in by_task.items() if xs}
 
 
@@ -99,7 +105,7 @@ def score(bench: Benchmark, attempts: list[Attempt], *, subset_id: str, harness_
         )
     value = statistics.fmean(values)
     stderr = statistics.stdev(values) / len(values) ** 0.5 if len(values) > 1 else 0.0
-    used = [a for a in attempts if not a.excluded]
+    used = counted(attempts)
     return EvalResult(
         task=bench.key,
         metric=bench.metric,
@@ -116,14 +122,14 @@ def score(bench: Benchmark, attempts: list[Attempt], *, subset_id: str, harness_
 
 def metrics(bench: Benchmark, attempts: list[Attempt], *, quick: bool) -> list[Metric]:
     """What the run cost per task, published under the benchmark's key so the site can show it."""
-    used = [a for a in attempts if not a.excluded]
+    used = counted(attempts)
     tasks = {a.task for a in used}
     n = len(tasks) or 1
     out = [
         Metric(key="eval_seconds_per_task", method=bench.key, value=round(sum(a.seconds for a in used) / n, 2), unit="s", n=len(tasks)),
         Metric(key="eval_tokens_per_task", method=bench.key, value=round(sum(a.completion_tokens for a in used) / n, 1), unit="tokens", n=len(tasks)),
         Metric(key="eval_length_stops", method=bench.key, value=sum(a.finish_reason == "length" for a in used), unit="count"),
-        Metric(key="eval_excluded", method=bench.key, value=len({a.task for a in attempts if a.excluded}), unit="count"),
+        Metric(key="eval_excluded", method=bench.key, value=len(excluded_tasks(attempts)), unit="count"),
     ]
     if quick and used:
         out.append(
@@ -133,7 +139,7 @@ def metrics(bench: Benchmark, attempts: list[Attempt], *, quick: bool) -> list[M
 
 
 def progress(bench: Benchmark, attempts: list[Attempt], n_planned: int) -> str:
-    done = len({a.task for a in attempts if not a.excluded})
+    done = len({a.task for a in counted(attempts)})
     scores = task_scores(attempts)
     solved = statistics.fmean(scores.values()) if scores else 0.0
     return f"{bench.key}: {done}/{n_planned} tasks, {solved:.1%} solved so far"
