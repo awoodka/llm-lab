@@ -274,6 +274,7 @@ def eval_cmd(
     unpublished_speed: bool = typer.Option(False, help="Size allowances from a local speed run that isn't published yet"),
 ) -> None:
     """Run capability benchmarks against a config. Chat pauses while they run; publish separately."""
+    from lab.evals.registry import missing_from_tier
     from lab.evals.runner import run_evals, summarise
 
     if tier not in ("quick", "deep"):
@@ -300,6 +301,9 @@ def eval_cmd(
         typer.echo(f"resume with: lab eval {ref} --tier {tier} --resume {rd.path.name}")
     elif bundle.run.raw.get("limited"):
         typer.echo("smoke test over a --limit subset: it stays local, since it is not the pinned benchmark")
+    elif missing := missing_from_tier(tier, {r.task for r in bundle.eval_results}):
+        typer.echo(f"the {tier} tier still needs {', '.join(missing)}; add it with: "
+                   f"lab eval {ref} --tier {tier} --resume {rd.path.name} --benchmarks {','.join(missing)}")
     else:
         typer.echo(f"publish with: lab publish {rd.path.name}")
 

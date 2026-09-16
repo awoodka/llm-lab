@@ -42,6 +42,11 @@ def tier_benchmarks(tier: Tier) -> list[Benchmark]:
     return [b for b in BENCHMARKS if b.tier == tier]
 
 
+def missing_from_tier(tier: str | None, scored: set[str]) -> list[str]:
+    """The tier's benchmarks a run hasn't scored. The site scores a tier as one run, so it must have them all."""
+    return [b.key for b in BENCHMARKS if b.tier == tier and b.key not in scored]
+
+
 def resolve(keys: list[str] | None, tier: Tier) -> list[Benchmark]:
     """The benchmarks a session will run: the whole tier, or the named subset of it."""
     if not keys:
