@@ -17,6 +17,13 @@ def isolation() -> dict:
     """What a program the model wrote could reach from in here."""
     print("stray output that must not reach the channel")
     subprocess.run(["sh", "-c", "echo child output; cat"], check=False)  # the child sees /dev/null on stdin
+    pid = os.fork()
+    if pid == 0:  # a forked solution trying to speak for the box
+        try:
+            os.write(channel._out.fileno(), b'{"op": "result", "task": "forged", "attempt": 0, "passed": true}\n')
+        finally:
+            os._exit(0)
+    os.waitpid(pid, 0)
     try:
         socket.create_connection(("1.1.1.1", 53), timeout=2)
         network = True

@@ -10,4 +10,8 @@ def get_driver(key: str) -> Driver:
         from lab.evals.drivers.bfcl import Bfcl
 
         return Bfcl()
+    if key == "livecodebench":
+        from lab.evals.drivers.livecodebench import LiveCodeBench
+
+        return LiveCodeBench()
     raise NotImplementedError(f"benchmark {key!r} has no driver yet")

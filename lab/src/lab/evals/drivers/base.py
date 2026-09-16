@@ -107,6 +107,10 @@ class BoxedDriver:
         """Which of the harness's tasks form the pinned subset, in order. All of them by default."""
         return tasks
 
+    def describe(self, chosen: list[dict[str, Any]]) -> dict[str, Any]:
+        """Anything about the chosen tasks that belongs in the pin, such as the date window they span."""
+        return {}
+
     def image(self):
         from lab.evals.sandbox import ensure_image
 
@@ -121,5 +125,5 @@ class BoxedDriver:
         return Subset(
             name=self.subset_name,
             tasks=[Task(id=t["id"], messages=[], answer="", meta=t.get("meta") or {}) for t in chosen],
-            source=listing.get("source") or {},
+            source={**(listing.get("source") or {}), **self.describe(chosen)},
         )

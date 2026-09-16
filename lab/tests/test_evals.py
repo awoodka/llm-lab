@@ -5,6 +5,7 @@ import json
 import pytest
 
 from lab.evals import registry
+from lab.evals.allowance import Allowance
 from lab.evals.drivers.aime import Aime2025, extract_answer
 from lab.evals.drivers.base import Subset, Task, check_against_pin
 from lab.evals.registry import BY_KEY
@@ -159,3 +160,81 @@ def test_the_bfcl_subset_is_stratified_interleaved_and_matches_its_pin():
     assert len(chosen) == PER_CATEGORY * len(CATEGORIES)
     assert [t["meta"]["category"] for t in chosen[:5]] == list(CATEGORIES), "a --limit smoke test touches every category"
     assert [t["id"] for t in chosen] == load_pin("bfcl")["task_ids"], "the committed pin is what the seed draws"
+
+
+def evals_bundle(speed_bundle, **raw):
+    b = speed_bundle(metrics=[], id="evals-1", kind="evals", tier="quick", status="ok", published_at=None)
+    b.run.raw.update(raw)
+    return b
+
+
+def test_a_resumed_run_keeps_its_benchmarks_and_adds_the_ones_asked_for(speed_bundle):
+    from lab.evals.runner import _benchmarks
+
+    prior = evals_bundle(speed_bundle, subsets={"aime_2025": {}})  # a run from before `benchmarks` was recorded
+    assert [b.key for b in _benchmarks(["bfcl"], "quick", prior)] == ["aime_2025", "bfcl"]
+    assert {b.key for b in _benchmarks(None, "quick", prior)} == {b.key for b in registry.tier_benchmarks("quick")}
+    assert [b.key for b in _benchmarks(["bfcl"], "quick", None)] == ["bfcl"]
+
+
+def test_a_resumed_run_is_sized_as_it_started_not_by_a_newer_speed_run(speed_bundle):
+    from lab.evals.allowance import Allowance, SpeedPoint
+    from lab.evals.runner import _allowance_for
+
+    started = Allowance(ctx=32768, pp0=8196, tg=[SpeedPoint(0, 180), SpeedPoint(16384, 163)], limit_s=300, speed_run_id="old")
+    prior = evals_bundle(speed_bundle, allowance=started.as_raw())
+    again = _allowance_for(None, None, "quick", True, prior)
+    assert again == started
+    assert again.for_prompt(8000) == started.for_prompt(8000)
+
+
+def test_resuming_on_another_engine_build_or_harness_is_refused(speed_bundle, tmp_path):
+    from types import SimpleNamespace
+
+    from lab.evals.runner import EvalError, _hold_run_to_its_start
+    from lab.evals.sandbox import Image
+    from lab.schema import EngineBuild
+    from lab.store import RunDir
+
+    rd = RunDir(tmp_path)
+    image = Image("bfcl", "lab-bfcl:aaa", "sha256:aaa", "web")
+    allowance = Allowance(ctx=65536, limit_s=None)
+    same_build = SimpleNamespace(build_info=lambda: EngineBuild(engine="llama.cpp", version="10883", commit_sha="91f6a6cf3"))
+    new_build = SimpleNamespace(build_info=lambda: EngineBuild(engine="llama.cpp", version="10990", commit_sha="0abc"))
+
+    bundle = evals_bundle(speed_bundle)
+    bundle.eval_results = [score(AIME, [attempt("t1", 1, True)], subset_id="s", harness_version="v", n_planned=1)]
+    _hold_run_to_its_start(rd, bundle, same_build, [AIME, BY_KEY["bfcl"]], allowance, {"bfcl": image}, resumed=True)
+    assert bundle.run.status == "running" and bundle.eval_results == [], "not publishable until it is scored again"
+    assert bundle.run.raw["benchmarks"] == ["aime_2025", "bfcl"]
+    assert bundle.run.raw["sandbox_images"]["bfcl"]["image_id"] == "sha256:aaa"
+
+    with pytest.raises(EvalError, match="one build"):
+        _hold_run_to_its_start(rd, bundle, new_build, [AIME], allowance, {}, resumed=True)
+    rebuilt = Image("bfcl", "lab-bfcl:bbb", "sha256:bbb", "web")
+    with pytest.raises(EvalError, match="one harness"):
+        _hold_run_to_its_start(rd, bundle, same_build, [AIME], allowance, {"bfcl": rebuilt}, resumed=True)
+
+
+def test_a_tier_is_published_whole_or_not_at_all(speed_bundle, tmp_path):
+    from lab.publish import PublishError, publish
+    from lab.store import RunDir
+
+    rd = RunDir(tmp_path)
+    bundle = evals_bundle(speed_bundle)
+    bundle.eval_results = [score(AIME, [attempt("t1", 1, True)], subset_id="s", harness_version="v", n_planned=1)]
+    rd.save(bundle)
+    with pytest.raises(PublishError, match="gpqa_diamond") as e:
+        publish(rd, dry_run=True)
+    assert "--benchmarks livecodebench,bfcl,gpqa_diamond" in str(e.value)
+
+
+def test_the_livecodebench_subset_is_the_newest_problems_in_date_order():
+    from lab.evals.drivers.livecodebench import NEWEST, LiveCodeBench
+
+    listing = [{"id": f"livecodebench/p{i}", "meta": {"contest_date": f"2025-{1 + i % 4:02d}-{1 + i % 28:02d}T00:00:00"}} for i in range(175)]
+    chosen = LiveCodeBench().select(listing)
+    dates = [t["meta"]["contest_date"] for t in chosen]
+    assert len(chosen) == NEWEST and dates == sorted(dates)
+    assert min(dates) >= max(t["meta"]["contest_date"] for t in listing if t not in chosen)
+    assert LiveCodeBench().describe(chosen)["date_window"] == [dates[0], dates[-1]]

@@ -3,7 +3,9 @@ lab/src/lab/evals/sandbox.py.
 
 The protocol runs on private copies of stdin and stdout. Descriptors 0 and 1 are pointed at /dev/null
 and stderr before any harness code runs, so a print, or a program the model wrote, can't write into the
-channel or read from it by accident.
+channel or read from it. The private copies aren't inherited by programs the box starts, and in a forked
+child (how graders usually run a solution) they point at /dev/null too, so only this process speaks for
+the box.
 """
 
 import itertools
@@ -24,8 +26,17 @@ class Channel:
     def __init__(self) -> None:
         self._in = os.fdopen(os.dup(0), "r", buffering=1, encoding="utf-8")
         self._out = os.fdopen(os.dup(1), "w", buffering=1, encoding="utf-8")
-        for fd in (self._in.fileno(), self._out.fileno()):
+        fds = (self._in.fileno(), self._out.fileno())
+        for fd in fds:
             os.set_inheritable(fd, False)
+
+        def drop_channel() -> None:
+            null = os.open(os.devnull, os.O_RDWR)
+            for fd in fds:
+                os.dup2(null, fd)
+            os.close(null)
+
+        os.register_at_fork(after_in_child=drop_channel)
         devnull = os.open(os.devnull, os.O_RDONLY)
         os.dup2(devnull, 0)
         os.close(devnull)

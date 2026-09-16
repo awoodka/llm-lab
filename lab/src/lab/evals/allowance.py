@@ -92,6 +92,17 @@ class Allowance:
         prompt_s = max(0, prompt_tokens - cached_tokens) / self.pp0
         return prompt_s + completion_tokens / tg_at_depth(self.tg, prompt_tokens)
 
+    @classmethod
+    def from_raw(cls, raw: dict[str, Any]) -> "Allowance":
+        """The sizing a run recorded, so a resumed run goes on exactly as it started."""
+        return cls(
+            ctx=int(raw["ctx"]),
+            pp0=float(raw.get("pp0") or 0.0),
+            tg=[SpeedPoint(int(p["depth"]), float(p["tps"])) for p in raw.get("tg") or []],
+            limit_s=raw.get("limit_s"),
+            speed_run_id=raw.get("speed_run_id"),
+        )
+
     def as_raw(self) -> dict[str, Any]:
         """What the run publishes about its own sizing, so a result can be re-derived later."""
         return {

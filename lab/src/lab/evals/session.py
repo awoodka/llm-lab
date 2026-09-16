@@ -91,7 +91,7 @@ def task_scores(attempts: list[Attempt]) -> dict[str, float]:
     return {task: statistics.fmean(a.passed for a in xs) for task, xs in by_task.items() if xs}
 
 
-def score(bench: Benchmark, attempts: list[Attempt], *, subset_id: str, harness_version: str, n_planned: int) -> EvalResult:
+def score(bench: Benchmark, attempts: list[Attempt], *, subset_id: str, harness_version: str, n_planned: int, harness: str = "lab") -> EvalResult:
     """The benchmark's result, with its standard error taken over tasks."""
     scores = task_scores(attempts)
     if not scores:
@@ -114,7 +114,7 @@ def score(bench: Benchmark, attempts: list[Attempt], *, subset_id: str, harness_
         n_samples=len(used),
         n_tasks=len(values),
         attempts_per_task=round(len(used) / len(values)) if values else None,
-        harness="lab",
+        harness=harness,
         harness_version=harness_version,
         subset_id=subset_id,
     )

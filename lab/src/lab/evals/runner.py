@@ -277,10 +277,11 @@ def run_evals(
     cli_args: str = "lab eval",
 ) -> RunDir:
     model, cfg = catalog.load_config(ref)
-    benches = registry.resolve(benchmark_keys, tier)  # type: ignore[arg-type]
+    prior = find_run(resume).load() if resume else None
+    benches = _benchmarks(benchmark_keys, tier, prior)
     deadline = parse_stop_at(stop_at)
 
-    # Everything that can fail without the GPU fails here: datasets, pins, and the speed run to size by.
+    # Everything that can fail without the GPU fails here: datasets, pins, harness images, and the sizing.
     subsets: dict[str, Subset] = {}
     for bench in benches:
         driver = get_driver(bench.key)
@@ -289,18 +290,18 @@ def run_evals(
         if limit:
             subset = Subset(name=f"{subset.name}[:{limit}]", tasks=subset.tasks[:limit], source=subset.source)
         subsets[bench.key] = subset
-    allowance = _allowance_for(model, cfg, tier, published_speed_only)
-
-    # Sandboxed harnesses: their images exist before the GPU is taken, and the run records which graded it.
+    allowance = _allowance_for(model, cfg, tier, published_speed_only, prior)
     images: dict[str, Image] = {b.key: get_driver(b.key).image() for b in benches if getattr(get_driver(b.key), "sandboxed", False)}
 
     rd, bundle, resumed = _open_run(ref, model, cfg, tier, cli_args, resume)
-    ctx = _ctx(rd, bundle, time.monotonic())
     engine = get_engine(model.engine)
+    _hold_run_to_its_start(rd, bundle, engine, benches, allowance, images, resumed)
+    ctx = _ctx(rd, bundle, time.monotonic())
     launch_cfg = _launch_config(cfg, parallel)
     argv = engine.server_argv(model, launch_cfg, host="127.0.0.1", port=EVAL_PORT)
     checkpoint = Checkpoint(rd.raw / "attempts.jsonl")
     session_started = time.monotonic()
+    session_started_at = now_iso()
     tel: Telemetry | None = None
     stopped_early = False
 
@@ -351,25 +352,23 @@ def run_evals(
             raise
         stopped_early = True
         print(f"\ninterrupted; resume with: lab eval {ref} --tier {tier} --resume {rd.path.name}", file=sys.stderr)
-        _save_progress(rd, bundle, checkpoint, session_started, benches, subsets)
+        _save_progress(rd, bundle, checkpoint, (session_started, session_started_at, tel), benches, subsets)
         return rd
 
     checkpoint.close()
     bundle.run.raw.update(
-        allowance=allowance.as_raw(),
         props=props,
         subsets={k: {"id": s.id, "name": s.name, "source": s.source, "n_tasks": len(s.tasks)} for k, s in subsets.items()},
         # Across sittings: an attempt re-asked after an interruption replaces its earlier entry.
         proxy_stats={**(bundle.run.raw.get("proxy_stats") or {}), **stats},
         proxy_count_mismatches=(bundle.run.raw.get("proxy_count_mismatches") or 0) + count_mismatches,
-        sandbox_images={**(bundle.run.raw.get("sandbox_images") or {}), **{k: i.as_raw() for k, i in images.items()}},
         parallel=parallel,
         limited=bool(limit),
         launch_overrides={"parallel": parallel, "ctx": launch_cfg.params.ctx} if parallel > 1 else {},
     )
     if attempts_note:
         bundle.run.raw["attempts_note"] = attempts_note
-    _save_progress(rd, bundle, checkpoint, session_started, benches, subsets)
+    _save_progress(rd, bundle, checkpoint, (session_started, session_started_at, tel), benches, subsets)
 
     if stopped_early or not _complete(checkpoint, benches, subsets, attempts_override):
         print(f"\nsitting over; resume with: lab eval {ref} --tier {tier} --resume {rd.path.name}", file=sys.stderr)
@@ -379,7 +378,22 @@ def run_evals(
 
 
 # -- pieces ------------------------------------------------------------------------------------
-def _allowance_for(model: ModelSpec, cfg: ConfigSpec, tier: str, published_only: bool) -> Allowance:
+def _benchmarks(keys: list[str] | None, tier: str, prior) -> list[Benchmark]:
+    """This sitting's benchmarks: the ones asked for, plus every one a resumed run already has.
+
+    Without `--benchmarks` that is the whole tier, so resuming a run completes it.
+    """
+    requested = registry.resolve(keys, tier)  # type: ignore[arg-type]
+    if prior is None:
+        return requested
+    had = prior.run.raw.get("benchmarks") or list(prior.run.raw.get("subsets") or {})
+    return registry.resolve(list(dict.fromkeys([*had, *(b.key for b in requested)])), tier)  # type: ignore[arg-type]
+
+
+def _allowance_for(model: ModelSpec, cfg: ConfigSpec, tier: str, published_only: bool, prior=None) -> Allowance:
+    if prior is not None and prior.run.raw.get("allowance"):
+        # A run keeps the sizing it started with, even if a newer speed run has been published since.
+        return Allowance.from_raw(prior.run.raw["allowance"])
     if tier == "deep":
         # Wall-clock limited per task: a request is capped only by the context it has left.
         return Allowance(ctx=cfg.params.ctx, limit_s=None)
@@ -401,6 +415,35 @@ def _open_run(ref: str, model: ModelSpec, cfg: ConfigSpec, tier: str, cli_args: 
     weights = catalog.resolve_model_path(model)
     ctx = start_run(model, cfg, "evals", get_engine(model.engine), weights, cli_args, tier=tier)
     return ctx.rd, ctx.bundle, False
+
+
+def _hold_run_to_its_start(rd: RunDir, bundle, engine, benches, allowance: Allowance, images: dict[str, Image], resumed: bool) -> None:
+    """A run spread over several sittings must still be one measurement: same engine build, same harness
+    images, same allowance. Check that on resume; record it before anything runs."""
+    raw = bundle.run.raw
+    if resumed:
+        build = engine.build_info()
+        was = bundle.engine_build
+        if (build.version, build.commit_sha) != (was.version, was.commit_sha):
+            raise EvalError(
+                f"{rd.path.name} started on {was.engine} {was.version} ({was.commit_sha}) and this is "
+                f"{build.version} ({build.commit_sha}); a run is measured on one build, so start a new run"
+            )
+        for key, image in images.items():
+            had = (raw.get("sandbox_images") or {}).get(key)
+            if had and had["image_id"] != image.image_id:
+                raise EvalError(
+                    f"{key}'s harness changed since {rd.path.name} started ({had['tag']} → {image.tag}); "
+                    "a run is graded by one harness, so start a new run"
+                )
+        # Scored again once every benchmark is done; until then the run isn't publishable.
+        bundle.run.status = "running"
+        bundle.eval_results = []
+        bundle.metrics = []
+    raw["benchmarks"] = [b.key for b in benches]
+    raw["allowance"] = allowance.as_raw()
+    raw["sandbox_images"] = {**(raw.get("sandbox_images") or {}), **{k: i.as_raw() for k, i in images.items()}}
+    rd.save(bundle)
 
 
 def _task_tag(bench: Benchmark, task: Task, attempt: int) -> str:
@@ -434,15 +477,21 @@ def _transcript_writer(rd: RunDir):
     return write
 
 
-def _sessions(bundle, session_started: float) -> list[dict[str, Any]]:
+def _sessions(bundle, sitting) -> list[dict[str, Any]]:
+    started, started_at, tel = sitting
     sessions = list(bundle.run.raw.get("sessions") or [])
-    sessions.append({"started_at": now_iso(), "seconds": round(time.monotonic() - session_started, 1)})
+    sessions.append({
+        "started_at": started_at,
+        "seconds": round(time.monotonic() - started, 1),
+        "lab_version": lab_version(),
+        "throttled": bool(tel is not None and tel.summary()["throttled"]),
+    })
     return sessions
 
 
-def _save_progress(rd: RunDir, bundle, checkpoint: Checkpoint, session_started: float, benches, subsets) -> None:
+def _save_progress(rd: RunDir, bundle, checkpoint: Checkpoint, sitting, benches, subsets) -> None:
     """Keep a stopped run readable: how far it got, and how much active time it has cost so far."""
-    sessions = _sessions(bundle, session_started)
+    sessions = _sessions(bundle, sitting)
     bundle.run.raw["sessions"] = sessions
     bundle.run.raw["progress"] = {
         b.key: {
@@ -466,19 +515,29 @@ def _complete(checkpoint: Checkpoint, benches, subsets, attempts_override: int |
 def _finish(rd: RunDir, bundle, checkpoint: Checkpoint, benches, subsets, tel, tier: str, session_started: float) -> None:
     results: list[EvalResult] = []
     all_metrics: list[Metric] = []
-    version = lab_version()
     for b in benches:
         attempts = checkpoint.for_benchmark(b.key)
         subset = subsets[b.key]
-        results.append(score(b, attempts, subset_id=subset.id, harness_version=version, n_planned=len(subset.tasks)))
+        harness, version = _harness(b, subset)
+        results.append(score(b, attempts, subset_id=subset.id, harness=harness, harness_version=version, n_planned=len(subset.tasks)))
         all_metrics += metrics(b, attempts, quick=tier == "quick")
     bundle.eval_results = results
     finish_ok(_ctx(rd, bundle, session_started), all_metrics, tel, telemetry_every_s=TELEMETRY_PUBLISH_S)
-    # finish_ok timed this sitting; the run's duration is the active time of every sitting it took.
-    bundle.run.duration_s = round(sum(s["seconds"] for s in bundle.run.raw.get("sessions") or []), 1)
+    # finish_ok saw only this sitting; the run's duration and throttling cover every sitting it took.
+    sessions = bundle.run.raw.get("sessions") or []
+    bundle.run.duration_s = round(sum(s["seconds"] for s in sessions), 1)
+    bundle.run.throttled = bool(bundle.run.throttled or any(s.get("throttled") for s in sessions))
     rd.save(bundle)
     for r in results:
         print(f"  {r.task}: {r.value:.1%} ± {(r.stderr or 0):.1%} over {r.n_tasks} tasks", file=sys.stderr)
+
+
+def _harness(bench: Benchmark, subset: Subset) -> tuple[str, str]:
+    """Who graded a benchmark: the harness in its sandbox, or the lab's own driver."""
+    if getattr(get_driver(bench.key), "sandboxed", False):
+        source = subset.source
+        return str(source.get("harness") or bench.key), str(source.get("harness_version") or source.get("commit") or "")
+    return "lab", lab_version()
 
 
 def summarise(rd: RunDir) -> str:

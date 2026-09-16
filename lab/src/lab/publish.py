@@ -55,6 +55,16 @@ def publish(rd: RunDir, dry_run: bool = False, replace: bool = False) -> dict:
         raise PublishError(
             f"run {rd.path.name} ran a --limit subset; it is a smoke test, not the pinned benchmark, so it stays local"
         )
+    if bundle.run.kind == "evals":
+        from lab.evals.registry import tier_benchmarks
+
+        scored = {r.task for r in bundle.eval_results}
+        missing = [b.key for b in tier_benchmarks(bundle.run.tier) if b.key not in scored]
+        if missing:
+            raise PublishError(
+                f"run {rd.path.name} has no {', '.join(missing)}; the site scores a tier as one run, so resume it "
+                f"with --benchmarks {','.join(missing)} first"
+            )
     payload = bundle.model_dump(mode="json")
     payload["bundle_sha"] = bundle.content_sha()
     check_no_local_paths(payload)
