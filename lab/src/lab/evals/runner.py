@@ -16,6 +16,7 @@ import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import ExitStack
 from dataclasses import replace
 from datetime import datetime, timedelta
 from typing import Any
@@ -33,6 +34,7 @@ from lab.evals.drivers import get_driver
 from lab.evals.drivers.base import Subset, Task, check_against_pin
 from lab.evals.proxy import AllowanceProxy
 from lab.evals.registry import Benchmark
+from lab.evals.sandbox import Box, Image, SandboxError
 from lab.evals.session import Attempt, Checkpoint, counted, excluded_tasks, metrics, progress, score
 from lab.gpu.hosted import exclusive_gpu
 from lab.schema import EvalResult, Metric
@@ -116,6 +118,8 @@ class EvalSession:
         self.lock = threading.Lock()
         self.client = httpx.Client(timeout=httpx.Timeout(connect=10.0, read=request_timeout, write=60.0, pool=60.0))
         self.stopping = False
+        #: Running harness containers, by benchmark key, for the sandboxed benchmarks.
+        self.boxes: dict[str, Box] = {}
 
     def check_deadline(self) -> None:
         if self.deadline is not None and time.monotonic() > self.deadline:
@@ -128,11 +132,14 @@ class EvalSession:
         Infrastructure failures are retried, then excluded. Only `content` is graded: a model's thinking
         (`reasoning_content`) is kept for the transcript but never read for an answer.
         """
+        if bench.key in self.boxes:
+            return self.answer_in_box(bench, task, attempt, self.boxes[bench.key])
         driver = get_driver(bench.key)
         record = Attempt(benchmark=bench.key, task=task.id, attempt=attempt)
         body = {"model": self.model_name, "messages": task.messages, **task.request}
-        headers = {"x-lab-task": f"{bench.key}:{task.id}#{attempt}"}
+        headers = {"x-lab-task": _task_tag(bench, task, attempt)}
         for tries_left in range(RETRIES, -1, -1):
+            self.proxy.reset_task(headers["x-lab-task"])
             started = time.monotonic()
             try:
                 r = self.client.post(f"{self.proxy.base_url}/chat/completions", json=body, headers=headers)
@@ -168,6 +175,57 @@ class EvalSession:
             return record, reply
         raise AssertionError("unreachable")
 
+    def answer_in_box(self, bench: Benchmark, task: Task, attempt: int, box: Box) -> tuple[Attempt, dict[str, Any]]:
+        """One task run by its harness in the sandbox; the lab only carries the conversation.
+
+        A task may take many requests. They share the task's time limit, and one that runs out of it
+        leaves the task unfinished, so it is scored as wrong whatever the harness concluded.
+        """
+        record = Attempt(benchmark=bench.key, task=task.id, attempt=attempt)
+        tag = _task_tag(bench, task, attempt)
+
+        def chat(body: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+            body = {**body, "model": self.model_name}
+            try:
+                r = self.client.post(f"{self.proxy.base_url}/chat/completions", json=body, headers={"x-lab-task": tag})
+            except httpx.HTTPError as e:
+                return 599, {"error": f"{type(e).__name__}: {e}"}
+            try:
+                return r.status_code, r.json()
+            except json.JSONDecodeError:
+                return 502, {"error": r.text[:500]}
+
+        for tries_left in range(RETRIES, -1, -1):
+            self.proxy.reset_task(tag)
+            started = time.monotonic()
+            try:
+                result = box.run(task.id, attempt, chat)
+            except SandboxError as e:
+                record.error = str(e)[-2000:]
+                record.seconds += time.monotonic() - started
+                try:
+                    box.restart()
+                except (OSError, SandboxError) as restart_error:
+                    record.error += f"\nrestart failed: {restart_error}"
+                if tries_left:
+                    time.sleep(5)
+                    continue
+                record.excluded = True
+                return record, {}
+            stats = self.proxy.stats.for_task(tag)
+            record.error = None
+            record.seconds += round(time.monotonic() - started, 2)
+            record.extracted = result.get("extracted")
+            record.detail = result.get("detail") or {}
+            record.prompt_tokens = stats.prompt_tokens
+            record.completion_tokens = stats.completion_tokens
+            record.allowance = stats.allowance_tokens // stats.requests if stats.requests else 0
+            record.finish_reason = "length" if stats.length_stops else "stop"
+            record.passed = bool(result.get("passed")) and not stats.length_stops
+            record.detail["requests"] = stats.requests
+            return record, {"transcript": result.get("transcript") or []}
+        raise AssertionError("unreachable")
+
     def run_benchmark(self, bench: Benchmark, subset: Subset, attempts: int, parallel: int, transcripts) -> None:
         jobs = [
             (task, attempt)
@@ -178,6 +236,8 @@ class EvalSession:
         excluded = excluded_tasks(self.checkpoint.for_benchmark(bench.key))
         if not jobs:
             return
+        if bench.key in self.boxes:
+            parallel = 1  # one harness container answers one task at a time
 
         def work(job: tuple[Task, int]) -> None:
             task, attempt = job
@@ -231,6 +291,9 @@ def run_evals(
         subsets[bench.key] = subset
     allowance = _allowance_for(model, cfg, tier, published_speed_only)
 
+    # Sandboxed harnesses: their images exist before the GPU is taken, and the run records which graded it.
+    images: dict[str, Image] = {b.key: get_driver(b.key).image() for b in benches if getattr(get_driver(b.key), "sandboxed", False)}
+
     rd, bundle, resumed = _open_run(ref, model, cfg, tier, cli_args, resume)
     ctx = _ctx(rd, bundle, time.monotonic())
     engine = get_engine(model.engine)
@@ -251,9 +314,13 @@ def run_evals(
                 server.wait_healthy(f"http://127.0.0.1:{EVAL_PORT}/health", timeout_s=HEALTH_TIMEOUT_S)
                 props = _props(f"http://127.0.0.1:{EVAL_PORT}")
                 attempts_note = None
-                with AllowanceProxy(f"http://127.0.0.1:{EVAL_PORT}", allowance, log_path=rd.logs / "requests.jsonl") as proxy:
+                with ExitStack() as stack:
+                    proxy = stack.enter_context(AllowanceProxy(f"http://127.0.0.1:{EVAL_PORT}", allowance, log_path=rd.logs / "requests.jsonl"))
                     limit_s = allowance.limit_s or DEEP_LIMIT_S
                     sess = EvalSession(proxy, checkpoint, f"{model.slug}/{cfg.slug}", deadline, request_timeout=limit_s * 4 + 120)
+                    for key, image in images.items():
+                        box = Box(image, get_driver(key).box_args(), log_path=rd.logs / f"sandbox-{key}.log")
+                        sess.boxes[key] = stack.enter_context(box)
                     for bench in benches:
                         attempts = attempts_override or bench.attempts
                         if attempts > 1 and _greedy(props):
@@ -295,6 +362,7 @@ def run_evals(
         # Across sittings: an attempt re-asked after an interruption replaces its earlier entry.
         proxy_stats={**(bundle.run.raw.get("proxy_stats") or {}), **stats},
         proxy_count_mismatches=(bundle.run.raw.get("proxy_count_mismatches") or 0) + count_mismatches,
+        sandbox_images={**(bundle.run.raw.get("sandbox_images") or {}), **{k: i.as_raw() for k, i in images.items()}},
         parallel=parallel,
         limited=bool(limit),
         launch_overrides={"parallel": parallel, "ctx": launch_cfg.params.ctx} if parallel > 1 else {},
@@ -333,6 +401,11 @@ def _open_run(ref: str, model: ModelSpec, cfg: ConfigSpec, tier: str, cli_args: 
     weights = catalog.resolve_model_path(model)
     ctx = start_run(model, cfg, "evals", get_engine(model.engine), weights, cli_args, tier=tier)
     return ctx.rd, ctx.bundle, False
+
+
+def _task_tag(bench: Benchmark, task: Task, attempt: int) -> str:
+    """How the proxy files one attempt's requests: its log, its stats and its share of the time limit."""
+    return f"{bench.key}:{task.id}#{attempt}"
 
 
 def _ctx(rd: RunDir, bundle, t0: float):

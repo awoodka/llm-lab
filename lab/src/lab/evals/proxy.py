@@ -8,6 +8,8 @@ request lands in one log. Two rules the proxy keeps:
   runs is what the config was launched with (`/props` records it in the run).
 - **It sizes every answer.** `max_tokens` becomes the allowance for that prompt; thinking counts toward
   it, and a request that ends on `length` is an unfinished answer, which the benchmark scores as wrong.
+  Requests tagged with the same task share its time limit: each answered request is charged its
+  uncached prompt and its generated tokens at the measured speeds, and the next one gets what is left.
 
 Prompt tokens are counted the way the server itself counts them: render the chat template, then
 tokenize it with special tokens added. `/apply-template` leaves out the BOS a model like Gemma 3 needs
@@ -58,8 +60,12 @@ class TaskStats:
     length_stops: int = 0
     errors: int = 0
     seconds: float = 0.0
+    #: How much of the task's time limit its answered requests used, at the measured speeds.
+    budget_s: float = 0.0
+    #: The latest prompt's size: the server still holds it, so the next request's prefix is cached.
+    last_prompt_tokens: int = 0
 
-    def add(self, *, prompt: int, completion: int, allowance: int, finish: str | None, seconds: float, error: bool) -> None:
+    def add(self, *, prompt: int, completion: int, allowance: int, finish: str | None, seconds: float, error: bool, cost_s: float = 0.0) -> None:
         self.requests += 1
         self.prompt_tokens += prompt
         self.completion_tokens += completion
@@ -67,6 +73,9 @@ class TaskStats:
         self.length_stops += finish == "length"
         self.errors += error
         self.seconds += seconds
+        self.budget_s += cost_s
+        if not error:
+            self.last_prompt_tokens = prompt
 
 
 @dataclass
@@ -80,7 +89,8 @@ class ProxyStats:
         total = TaskStats()
         for t in self.tasks.values():
             for k, v in asdict(t).items():
-                setattr(total, k, getattr(total, k) + v)
+                if k != "last_prompt_tokens":
+                    setattr(total, k, getattr(total, k) + v)
         return total
 
 
@@ -158,6 +168,22 @@ class AllowanceProxy:
         tokens.raise_for_status()
         return len(tokens.json()["tokens"])
 
+    def reset_task(self, task: str) -> None:
+        """Forget a task's spending, so a retry after an infrastructure failure starts with its full limit."""
+        with self._lock:
+            self.stats.tasks.pop(task, None)
+
+    def size(self, task: str, prompt_tokens: int) -> tuple[int, int]:
+        """The allowance for this request of `task`, and how much of its prompt is assumed cached.
+
+        Before the answer, the cached part is an estimate: the task's previous prompt, which the server's
+        single slot still holds. The charge afterwards uses what the server reports.
+        """
+        with self._lock:
+            stats = self.stats.for_task(task)
+            cached = min(stats.last_prompt_tokens, prompt_tokens) if stats.requests else 0
+            return self.allowance.for_prompt(prompt_tokens, spent_s=stats.budget_s, cached_tokens=cached), cached
+
     @staticmethod
     def sized_body(body: dict[str, Any], allowance: int) -> dict[str, Any]:
         out = {k: v for k, v in body.items() if k not in SAMPLING_FIELDS and k not in LENGTH_FIELDS}
@@ -172,7 +198,17 @@ class AllowanceProxy:
             if reported is not None and reported != entry.get("prompt_tokens"):
                 entry["count_mismatch"] = True
                 self.count_mismatches += 1
+            cost_s = 0.0
+            if not entry.get("error") and entry.get("prompt_tokens"):
+                cached = entry.get("cached_tokens")
+                cost_s = self.allowance.cost_s(
+                    entry["prompt_tokens"],
+                    entry.get("cached_estimate", 0) if cached is None else cached,
+                    entry.get("completion_tokens") or 0,
+                )
+                entry["cost_s"] = round(cost_s, 3)
             self.stats.for_task(task).add(
+                cost_s=cost_s,
                 prompt=entry.get("prompt_tokens") or 0,
                 completion=entry.get("completion_tokens") or 0,
                 allowance=entry.get("allowance") or 0,
@@ -264,13 +300,14 @@ def _make_handler(proxy: AllowanceProxy) -> type[BaseHTTPRequestHandler]:
                 self._error(502, f"could not count the prompt: {e}")
                 return
 
-            allowance = proxy.allowance.for_prompt(prompt_tokens)
+            allowance, cached_estimate = proxy.size(task, prompt_tokens)
             sized_headers = {"x-lab-prompt-tokens": str(prompt_tokens), "x-lab-allowance": str(allowance)}
             entry = {
                 "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                 "task": task,
                 "prompt_tokens": prompt_tokens,
                 "allowance": allowance,
+                "cached_estimate": cached_estimate,
             }
             if allowance <= 0:
                 entry.update(completion_tokens=0, finish_reason="length", seconds=time.monotonic() - started, no_allowance=True)
@@ -341,6 +378,7 @@ def _make_handler(proxy: AllowanceProxy) -> type[BaseHTTPRequestHandler]:
                             pass
             usage, finish = _usage_from_stream(chunks)
             entry.update(
+                cached_tokens=(usage.get("prompt_tokens_details") or {}).get("cached_tokens"),
                 server_prompt_tokens=usage.get("prompt_tokens"),
                 completion_tokens=usage.get("completion_tokens", 0),
                 finish_reason=finish,

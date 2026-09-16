@@ -246,3 +246,86 @@ def test_the_runner_keeps_the_reply_it_graded_and_the_allowance_it_was_given(pro
     assert (record.extracted, record.passed) == ("12", False), "only the answer is graded, never the thinking"
     assert record.prompt_tokens == 101
     assert record.allowance == upstream.seen[-1]["max_tokens"], "the size that was enforced, not a recomputation"
+
+
+def test_requests_of_one_task_share_its_time_limit(proxy, upstream, tmp_path):
+    # Three turns of one conversation; the fake answers each with 12 tokens and reports 3 cached.
+    for turn in range(3):
+        chat(proxy, words=8000 + turn * 100, task="bfcl:multi_turn_base_0#1")
+    sent = [b["max_tokens"] for b in upstream.seen]
+    assert sent[0] == 8759, "the first request is sized like any single request"
+    assert sent[0] > sent[1] > sent[2], "later requests get what the earlier ones left"
+
+    lines = [json.loads(x) for x in (tmp_path / "requests.jsonl").read_text().splitlines()]
+    assert [x["cached_estimate"] for x in lines] == [0, 8000, 8100], "the previous prompt is still in the slot"
+    stats = proxy.stats.for_task("bfcl:multi_turn_base_0#1")
+    assert stats.budget_s == pytest.approx(sum(x["cost_s"] for x in lines), abs=0.01)
+    # The charge uses the server's own cached count (3), so each prompt is almost fully paid for.
+    assert lines[0]["cost_s"] == pytest.approx(QWEN.cost_s(8000, 3, 12), abs=0.001)
+
+    other = chat(proxy, words=8000, task="bfcl:multi_turn_base_1#1")
+    assert other.headers["x-lab-allowance"] == "8759", "another task starts with its own full limit"
+
+
+class FakeBox:
+    """Stands in for a harness container: asks the model `turns` times, then reports its verdict."""
+
+    def __init__(self, turns=2, words=100, passed=True, fail_times=0):
+        self.turns, self.words, self.passed, self.fail_times = turns, words, passed, fail_times
+        self.restarts = 0
+
+    def run(self, task, attempt, chat):
+        from lab.evals.sandbox import SandboxError
+
+        if self.fail_times:
+            self.fail_times -= 1
+            chat({"messages": [{"role": "user", "content": "doomed"}]})  # spends budget that a retry must get back
+            raise SandboxError("harness failure: Traceback …")
+        transcript = []
+        for turn in range(self.turns):
+            body = {"messages": [{"role": "user", "content": " ".join(["word"] * (self.words + turn * 50))}], "model": "ignored"}
+            status, reply = chat(body)
+            assert status == 200
+            transcript.append({"request": body, "reply": reply})
+        return {"task": task, "attempt": attempt, "passed": self.passed, "extracted": "f(x=1)", "detail": {"category": "multi_turn_base"}, "transcript": transcript}
+
+    def restart(self):
+        self.restarts += 1
+
+
+def boxed_session(proxy, box):
+    session = EvalSession(proxy, checkpoint=None, model_name="gemma/32k", deadline=None, request_timeout=30)
+    session.boxes["bfcl"] = box
+    return session
+
+
+def test_a_boxed_task_is_graded_by_its_harness_and_costed_by_the_proxy(proxy, upstream):
+    session = boxed_session(proxy, FakeBox(turns=2))
+    task = Task(id="multi_turn_base_0", messages=[], answer="")
+    record, reply = session.answer(BY_KEY["bfcl"], task, 1)
+
+    assert record.passed and record.extracted == "f(x=1)" and not record.excluded
+    assert record.detail == {"category": "multi_turn_base", "requests": 2}
+    assert record.prompt_tokens == 100 + 150 and record.completion_tokens == 24, "summed over the task's requests"
+    assert record.allowance == sum(b["max_tokens"] for b in upstream.seen) // 2
+    assert all(b["model"] == "gemma/32k" for b in upstream.seen), "the lab names the model, not the harness"
+    assert len(reply["transcript"]) == 2
+
+
+def test_a_boxed_task_that_ran_out_of_time_is_wrong_whatever_the_harness_said(upstream, tmp_path):
+    tight = Allowance(ctx=65536, pp0=949, tg=[SpeedPoint(0, 31.8)], limit_s=2.0)
+    with AllowanceProxy(upstream.url, tight, log_path=tmp_path / "r.jsonl") as proxy:
+        record, _ = boxed_session(proxy, FakeBox(turns=2, passed=True)).answer(BY_KEY["bfcl"], Task(id="t", messages=[], answer=""), 1)
+    assert record.finish_reason == "length" and not record.passed
+
+
+def test_a_broken_harness_is_retried_with_a_fresh_limit_then_excluded(proxy, upstream, monkeypatch):
+    monkeypatch.setattr("lab.evals.runner.time.sleep", lambda s: None)
+    box = FakeBox(fail_times=1)
+    record, _ = boxed_session(proxy, box).answer(BY_KEY["bfcl"], Task(id="t", messages=[], answer=""), 1)
+    assert record.passed and not record.excluded and box.restarts == 1
+    assert record.detail["requests"] == 2, "the failed try's request isn't charged to the retry"
+
+    box = FakeBox(fail_times=99)
+    record, _ = boxed_session(proxy, box).answer(BY_KEY["bfcl"], Task(id="u", messages=[], answer=""), 1)
+    assert record.excluded and "harness failure" in record.error and box.restarts == 3

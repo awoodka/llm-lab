@@ -28,6 +28,21 @@ def test_allowance_vectors(pp0, tg, ctx, prompt, limit_s, expected):
     assert Allowance(ctx=ctx, pp0=pp0, tg=tg, limit_s=limit_s).for_prompt(prompt) == expected
 
 
+def test_requests_of_one_task_share_its_time_limit():
+    a = Allowance(ctx=65536, pp0=949, tg=QWEN_TG, limit_s=300)
+    first = a.for_prompt(8000)
+    assert first == 8759
+    # The first answer used 3,000 tokens; the second request re-sends that conversation plus a tool result.
+    spent = a.cost_s(8000, 0, 3000)
+    assert spent == pytest.approx(8000 / 949 + 3000 / tg_at_depth(QWEN_TG, 8000))
+    second = a.for_prompt(11_200, spent_s=spent, cached_tokens=8000)
+    seconds_left = 300 - spent - 3200 / 949
+    assert second == int(seconds_left * tg_at_depth(QWEN_TG, 11_200))
+    assert second < first - 3000, "the second answer gets what the first left over, not a fresh limit"
+    assert a.for_prompt(11_200, spent_s=300) == 0, "a spent task gets nothing more"
+    assert Allowance(ctx=65536, limit_s=None).cost_s(8000, 0, 3000) == 0.0, "the deep tier runs on the wall clock"
+
+
 def test_tg_at_depth_clamps_below_the_first_depth_and_never_goes_under_1():
     assert tg_at_depth(QWEN_TG, 0) == 31.8
     assert tg_at_depth(QWEN_TG, -100) == 31.8

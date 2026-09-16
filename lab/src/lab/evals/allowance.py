@@ -65,7 +65,14 @@ class Allowance:
     limit_s: float | None = None
     speed_run_id: str | None = None
 
-    def for_prompt(self, prompt_tokens: int) -> int:
+    def for_prompt(self, prompt_tokens: int, *, spent_s: float = 0.0, cached_tokens: int = 0) -> int:
+        """Tokens this request may generate.
+
+        A task that takes several requests (an agent, a multi-turn conversation) shares one time limit:
+        `spent_s` is what its earlier requests cost, and `cached_tokens` is the part of this prompt the
+        server already holds, which costs nothing to process again. For a single request both are 0,
+        which is the plan's formula exactly.
+        """
         context_left = self.ctx - prompt_tokens
         if context_left <= 0:
             return 0
@@ -73,10 +80,17 @@ class Allowance:
             return context_left
         if self.pp0 <= 0 or not self.tg:
             return 0
-        seconds_left = self.limit_s - prompt_tokens / self.pp0
+        seconds_left = self.limit_s - spent_s - max(0, prompt_tokens - cached_tokens) / self.pp0
         if seconds_left <= 0:
             return 0
         return max(0, min(int(seconds_left * tg_at_depth(self.tg, prompt_tokens)), context_left))
+
+    def cost_s(self, prompt_tokens: int, cached_tokens: int, completion_tokens: int) -> float:
+        """What one answered request took out of its task's limit, at the measured speeds."""
+        if self.limit_s is None or self.pp0 <= 0 or not self.tg:
+            return 0.0
+        prompt_s = max(0, prompt_tokens - cached_tokens) / self.pp0
+        return prompt_s + completion_tokens / tg_at_depth(self.tg, prompt_tokens)
 
     def as_raw(self) -> dict[str, Any]:
         """What the run publishes about its own sizing, so a result can be re-derived later."""
