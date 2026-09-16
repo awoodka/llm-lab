@@ -274,7 +274,7 @@ class FakeBox:
         self.turns, self.words, self.passed, self.fail_times = turns, words, passed, fail_times
         self.restarts = 0
 
-    def run(self, task, attempt, chat):
+    def run(self, task, attempt, chat, options=None):
         from lab.evals.sandbox import SandboxError
 
         if self.fail_times:

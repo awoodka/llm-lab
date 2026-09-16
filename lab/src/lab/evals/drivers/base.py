@@ -103,6 +103,10 @@ class BoxedDriver:
     def box_args(self) -> list[str]:
         return []
 
+    def options(self, props: dict[str, Any]) -> dict[str, Any]:
+        """Harness settings for this config, from what its server reports (`/props`). Fixed for a run."""
+        return {}
+
     def select(self, tasks: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """Which of the harness's tasks form the pinned subset, in order. All of them by default."""
         return tasks

@@ -9,8 +9,7 @@
       "parallel",
       "parallel_multiple",
       "multi_turn_base"
-    ],
-    "mode": "FC"
+    ]
   },
   "task_ids": [
     "simple_python_3",

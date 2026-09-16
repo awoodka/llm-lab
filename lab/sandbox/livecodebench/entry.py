@@ -85,7 +85,7 @@ def load(qid: str) -> CodeGenerationProblem:
         return CodeGenerationProblem(**json.loads(fh.readline()))
 
 
-def run_task(task_id: str, attempt: int) -> dict:
+def run_task(task_id: str, attempt: int, options: dict) -> dict:
     qid = task_id.removeprefix(PREFIX)
     if qid not in OFFSETS:
         raise KeyError(f"no LiveCodeBench problem {qid!r} in {RELEASE.name}")

@@ -1,7 +1,9 @@
-"""BFCL (bfcl-eval 2026.3.23) with native tool calls, run by its own handler and graded by its own checkers.
+"""BFCL (bfcl-eval 2026.3.23), run by its own handler and graded by its own checkers.
 
 Five categories: simple_python, multiple, parallel, parallel_multiple and multi_turn_base. The lab picks
-the subset. Each task goes through BFCL's OpenAI chat-completions FC handler, whose client is the lab's
+the subset, and the mode: "FC" (native tool calls) when the model's chat template supports tools,
+otherwise "prompting", where BFCL puts the functions in the system prompt and parses Python-style calls
+from the reply. Each task goes through BFCL's OpenAI chat-completions handler, whose client is the lab's
 channel. Multi-turn calls execute in BFCL's simulated environments, which `eval` what the model asked
 for, which is why this runs in the sandbox. The per-entry evaluation copies eval_runner.py's
 `_evaluate_single_ast_entry` and `_evaluate_single_multi_turn_entry`.
@@ -9,8 +11,8 @@ for, which is why this runs in the sandbox. The per-entry evaluation copies eval
 Two parts of the package are replaced by stubs, because these categories never reach them and importing
 them pulls in heavy dependencies:
 
-- the model registry, which imports every vendor SDK. The stub holds one entry, with the flag that maps
-  BFCL's underscored tool names back to dotted ones, as the real FC entries do.
+- the model registry, which imports every vendor SDK. The stub holds one entry per mode, flagged like
+  BFCL's real entries: FC maps its underscored tool names back to dotted ones, prompting keeps them.
 - the Java and JavaScript parsers (tree-sitter).
 """
 
@@ -23,7 +25,8 @@ from types import SimpleNamespace
 
 from boxproto import Channel, ChannelOpenAI, ModelUnavailable
 
-REGISTRY = "llama-server-FC"
+# BFCL decides FC vs prompting partly by whether "FC" is in the registry name.
+REGISTRY = {"FC": "llama-server-FC", "prompting": "llama-server-prompt"}
 MODEL = "lab"
 CATEGORIES = ("simple_python", "multiple", "parallel", "parallel_multiple", "multi_turn_base")
 VERSION = "2026.3.23"
@@ -40,7 +43,10 @@ def _not_here(*args, **kwargs):
 
 
 _stub("bfcl_eval.constants.model_config",
-      MODEL_CONFIG_MAPPING={REGISTRY: SimpleNamespace(underscore_to_dot=True, is_fc_model=True)})
+      MODEL_CONFIG_MAPPING={
+          REGISTRY["FC"]: SimpleNamespace(underscore_to_dot=True, is_fc_model=True),
+          REGISTRY["prompting"]: SimpleNamespace(underscore_to_dot=False, is_fc_model=False),
+      })
 _stub("bfcl_eval.model_handler.parser.java_parser", parse_java_function_call=_not_here)
 _stub("bfcl_eval.model_handler.parser.js_parser", parse_javascript_function_call=_not_here)
 os.makedirs(os.environ["BFCL_PROJECT_ROOT"], exist_ok=True)
@@ -72,7 +78,7 @@ def category_of(entry_id: str) -> str:
 
 def list_tasks() -> dict:
     tasks = [{"id": entry_id, "meta": {"category": category_of(entry_id)}} for entry_id in PROMPTS]
-    return {"tasks": tasks, "source": {"harness": "bfcl-eval", "harness_version": VERSION, "categories": list(CATEGORIES), "mode": "FC"}}
+    return {"tasks": tasks, "source": {"harness": "bfcl-eval", "harness_version": VERSION, "categories": list(CATEGORIES)}}
 
 
 def forget_instances() -> None:
@@ -82,9 +88,11 @@ def forget_instances() -> None:
         del names[name]
 
 
-def new_handler(client: ChannelOpenAI) -> OpenAICompletionsHandler:
-    # BFCL's CLI default. The lab strips sampling, so the config's own settings decide it in the end.
-    handler = OpenAICompletionsHandler(model_name=MODEL, temperature=0.001, registry_name=REGISTRY, is_fc_model=True)
+def new_handler(client: ChannelOpenAI, mode: str) -> OpenAICompletionsHandler:
+    if mode not in REGISTRY:
+        raise ValueError(f"unknown BFCL mode {mode!r}; FC or prompting")
+    # BFCL's CLI default temperature. The lab strips sampling, so the config's own settings decide it.
+    handler = OpenAICompletionsHandler(model_name=MODEL, temperature=0.001, registry_name=REGISTRY[mode], is_fc_model=mode == "FC")
     handler.client = client
     return handler
 
@@ -98,7 +106,7 @@ def grade_ast(handler, entry_id: str, result) -> dict:
         return {"valid": False, "error_type": "ast_decoder:decoder_failed", "error": [f"Invalid syntax. Failed to decode AST. {e}"]}
     if not is_function_calling_format_output(decoded):
         return {"valid": False, "error_type": "ast_decoder:decoder_wrong_output_format", "decoded": str(decoded)}
-    checked = ast_checker(prompt["function"], decoded, truth, Language.PYTHON, category, REGISTRY)
+    checked = ast_checker(prompt["function"], decoded, truth, Language.PYTHON, category, handler.registry_name)
     return {**checked, "decoded": decoded}
 
 
@@ -121,16 +129,16 @@ def grade_multi_turn(handler, entry_id: str, result) -> dict:
             if not is_empty_execute_response(decoded):
                 decoded_steps.append(decoded)
         decoded_turns.append(decoded_steps)
-    checked = multi_turn_checker(decoded_turns, truth, prompt, category_of(entry_id), REGISTRY)
+    checked = multi_turn_checker(decoded_turns, truth, prompt, category_of(entry_id), handler.registry_name)
     return {**checked, "decoded": decoded_turns}
 
 
-def run_task(entry_id: str, attempt: int) -> dict:
+def run_task(entry_id: str, attempt: int, options: dict) -> dict:
     if entry_id not in PROMPTS:
         raise KeyError(f"no BFCL entry {entry_id!r} in {', '.join(CATEGORIES)}")
     forget_instances()
     client = ChannelOpenAI(channel)
-    handler = new_handler(client)
+    handler = new_handler(client, options.get("mode", "FC"))
     try:
         result, _metadata = handler.inference(copy.deepcopy(PROMPTS[entry_id]), False, False)
     except ModelUnavailable:
@@ -145,7 +153,7 @@ def run_task(entry_id: str, attempt: int) -> dict:
     decoded = verdict.pop("decoded", None)
     passed = bool(verdict.pop("valid", False))
     extracted = json.dumps(decoded, default=str)[:500] if decoded is not None else None
-    detail = {"category": category_of(entry_id)}
+    detail = {"category": category_of(entry_id), "mode": options.get("mode", "FC")}
     if not passed:
         detail["error_type"] = verdict.get("error_type")
         detail["error"] = json.dumps(verdict.get("error") or verdict.get("details") or verdict, default=str)[:600]

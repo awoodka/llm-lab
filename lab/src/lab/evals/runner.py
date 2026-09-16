@@ -87,6 +87,7 @@ def _props(base_url: str) -> dict[str, Any]:
         "n_ctx": d.get("default_generation_settings", {}).get("n_ctx") or d.get("n_ctx"),
         "total_slots": d.get("total_slots"),
         "build_info": d.get("build_info"),
+        "chat_template_caps": d.get("chat_template_caps"),
     }
 
 
@@ -118,8 +119,9 @@ class EvalSession:
         self.lock = threading.Lock()
         self.client = httpx.Client(timeout=httpx.Timeout(connect=10.0, read=request_timeout, write=60.0, pool=60.0))
         self.stopping = False
-        #: Running harness containers, by benchmark key, for the sandboxed benchmarks.
+        #: Running harness containers, by benchmark key, for the sandboxed benchmarks, and their settings.
         self.boxes: dict[str, Box] = {}
+        self.box_options: dict[str, dict[str, Any]] = {}
 
     def check_deadline(self) -> None:
         if self.deadline is not None and time.monotonic() > self.deadline:
@@ -199,7 +201,7 @@ class EvalSession:
             self.proxy.reset_task(tag)
             started = time.monotonic()
             try:
-                result = box.run(task.id, attempt, chat)
+                result = box.run(task.id, attempt, chat, self.box_options.get(bench.key))
             except SandboxError as e:
                 record.error = str(e)[-2000:]
                 record.seconds += time.monotonic() - started
@@ -319,6 +321,7 @@ def run_evals(
                     proxy = stack.enter_context(AllowanceProxy(f"http://127.0.0.1:{EVAL_PORT}", allowance, log_path=rd.logs / "requests.jsonl"))
                     limit_s = allowance.limit_s or DEEP_LIMIT_S
                     sess = EvalSession(proxy, checkpoint, f"{model.slug}/{cfg.slug}", deadline, request_timeout=limit_s * 4 + 120)
+                    sess.box_options = _harness_options(rd, bundle, images, props)
                     for key, image in images.items():
                         box = Box(image, get_driver(key).box_args(), log_path=rd.logs / f"sandbox-{key}.log")
                         sess.boxes[key] = stack.enter_context(box)
@@ -446,6 +449,20 @@ def _hold_run_to_its_start(rd: RunDir, bundle, engine, benches, allowance: Allow
     rd.save(bundle)
 
 
+def _harness_options(rd: RunDir, bundle, images: dict[str, Image], props: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """Each harness's settings for this config, the same in every sitting of a run."""
+    recorded = bundle.run.raw.get("harness_options") or {}
+    options = {}
+    for key in images:
+        chosen = get_driver(key).options(props)
+        if key in recorded and recorded[key] != chosen:
+            raise EvalError(f"{key} ran with {recorded[key]} in earlier sittings of {rd.path.name}, but the server now calls for {chosen}")
+        options[key] = chosen
+    bundle.run.raw["harness_options"] = {**recorded, **options}
+    rd.save(bundle)
+    return options
+
+
 def _task_tag(bench: Benchmark, task: Task, attempt: int) -> str:
     """How the proxy files one attempt's requests: its log, its stats and its share of the time limit."""
     return f"{bench.key}:{task.id}#{attempt}"
@@ -519,7 +536,9 @@ def _finish(rd: RunDir, bundle, checkpoint: Checkpoint, benches, subsets, tel, t
         attempts = checkpoint.for_benchmark(b.key)
         subset = subsets[b.key]
         harness, version = _harness(b, subset)
-        results.append(score(b, attempts, subset_id=subset.id, harness=harness, harness_version=version, n_planned=len(subset.tasks)))
+        result = score(b, attempts, subset_id=subset.id, harness=harness, harness_version=version, n_planned=len(subset.tasks))
+        result.gen_kwargs = dict((bundle.run.raw.get("harness_options") or {}).get(b.key) or {})
+        results.append(result)
         all_metrics += metrics(b, attempts, quick=tier == "quick")
     bundle.eval_results = results
     finish_ok(_ctx(rd, bundle, session_started), all_metrics, tel, telemetry_every_s=TELEMETRY_PUBLISH_S)

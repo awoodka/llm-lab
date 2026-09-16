@@ -9,7 +9,7 @@ benchmark code, and `web` only ever sees the conversation.
 The channel is `ssh web docker run -i ...`, one JSON object per line:
 
     lab → box  {"op": "list"}                              box → lab  {"op": "tasks", "tasks": [...], "source": {...}}
-    lab → box  {"op": "run", "task": ID, "attempt": N}
+    lab → box  {"op": "run", "task": ID, "attempt": N, "options": {...}}      options: the run's harness settings
     box → lab  {"op": "chat", "id": K, "body": {...}}     lab → box  {"op": "reply", "id": K, "status": S, "body": {...}}
     box → lab  {"op": "log", "message": "..."}
     box → lab  {"op": "result", "task": ID, "attempt": N, "passed": B, "extracted": ..., "detail": {...}, "transcript": [...]}
@@ -267,9 +267,9 @@ class Box:
         self._send({"op": "list"})
         return self._expect("tasks")
 
-    def run(self, task: str, attempt: int, chat: ChatFn) -> dict[str, Any]:
+    def run(self, task: str, attempt: int, chat: ChatFn, options: dict[str, Any] | None = None) -> dict[str, Any]:
         """Run one task to its verdict, answering the harness's chat requests with `chat`."""
-        self._send({"op": "run", "task": task, "attempt": attempt})
+        self._send({"op": "run", "task": task, "attempt": attempt, "options": options or {}})
         result = self._expect("result", chat)
         if result.get("task") != task or result.get("attempt") != attempt:
             raise SandboxError(f"the sandbox answered for {result.get('task')}#{result.get('attempt')}, not {task}#{attempt}")

@@ -37,7 +37,7 @@ def isolation() -> dict:
     return {"network": network, "root_writable": root_writable, "uid": os.getuid(), "tmp_writable": os.access("/tmp", os.W_OK)}
 
 
-def run_task(task: str, attempt: int) -> dict:
+def run_task(task: str, attempt: int, options: dict) -> dict:
     body = {"messages": [{"role": "user", "content": "What is 2 + 2? Answer with the number only."}]}
     reply = channel.chat(body)
     text = reply["choices"][0]["message"].get("content") or ""

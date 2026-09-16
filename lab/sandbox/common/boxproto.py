@@ -69,11 +69,12 @@ class Channel:
             raise ModelUnavailable(f"model request failed with {reply['status']}: {str(reply['body'])[:300]}")
         return reply["body"]
 
-    def serve(self, list_tasks: Callable[[], dict[str, Any]], run_task: Callable[[str, int], dict[str, Any]]) -> None:
+    def serve(self, list_tasks: Callable[[], dict[str, Any]], run_task: Callable[[str, int, dict[str, Any]], dict[str, Any]]) -> None:
         """Answer the lab until it closes the channel.
 
-        `run_task` returns the verdict: passed, extracted, detail, transcript. Anything it raises is a
-        harness failure, so a harness must catch what a bad answer can cause and grade it as wrong.
+        `run_task(task, attempt, options)` returns the verdict: passed, extracted, detail, transcript.
+        `options` are the run's harness settings, chosen by the lab. Anything it raises is a harness
+        failure, so a harness must catch what a bad answer can cause and grade it as wrong.
         """
         while (msg := self.recv()) is not None:
             op = msg.get("op")
@@ -82,7 +83,7 @@ class Channel:
             elif op == "run":
                 task, attempt = msg["task"], msg["attempt"]
                 try:
-                    verdict = run_task(task, attempt)
+                    verdict = run_task(task, attempt, msg.get("options") or {})
                 except Exception:  # noqa: BLE001 - reported to the lab, which retries or excludes
                     self.send(op="failed", task=task, attempt=attempt, message=traceback.format_exc()[-3000:])
                     continue

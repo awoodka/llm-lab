@@ -25,6 +25,12 @@ class Bfcl(BoxedDriver):
     sandbox = "bfcl"
     subset_name = "bfcl_quick_400"
 
+    def options(self, props: dict[str, Any]) -> dict[str, Any]:
+        """Native tool calls when the chat template can do them; BFCL's prompting mode when it can't."""
+        caps = props.get("chat_template_caps") or {}
+        native = bool(caps.get("supports_tools") and caps.get("supports_tool_calls"))
+        return {"mode": "FC" if native else "prompting"}
+
     def select(self, tasks: list[dict[str, Any]]) -> list[dict[str, Any]]:
         by_category: dict[str, list[dict[str, Any]]] = defaultdict(list)
         for t in tasks:

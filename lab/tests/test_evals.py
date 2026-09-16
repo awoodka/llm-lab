@@ -238,3 +238,13 @@ def test_the_livecodebench_subset_is_the_newest_problems_in_date_order():
     assert len(chosen) == NEWEST and dates == sorted(dates)
     assert min(dates) >= max(t["meta"]["contest_date"] for t in listing if t not in chosen)
     assert LiveCodeBench().describe(chosen)["date_window"] == [dates[0], dates[-1]]
+
+
+def test_bfcl_calls_tools_natively_only_when_the_chat_template_can():
+    from lab.evals.drivers.bfcl import Bfcl
+
+    qwen = {"chat_template_caps": {"supports_tools": True, "supports_tool_calls": True}}
+    gemma = {"chat_template_caps": {"supports_tools": False, "supports_tool_calls": False}}
+    assert Bfcl().options(qwen) == {"mode": "FC"}
+    assert Bfcl().options(gemma) == {"mode": "prompting"}
+    assert Bfcl().options({}) == {"mode": "prompting"}, "a server that doesn't say gets the mode that always works"
