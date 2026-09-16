@@ -248,3 +248,37 @@ def test_bfcl_calls_tools_natively_only_when_the_chat_template_can():
     assert Bfcl().options(qwen) == {"mode": "FC"}
     assert Bfcl().options(gemma) == {"mode": "prompting"}
     assert Bfcl().options({}) == {"mode": "prompting"}, "a server that doesn't say gets the mode that always works"
+
+
+def test_gpqa_questions_are_shuffled_once_and_graded_by_the_last_answer_line(tmp_path, monkeypatch):
+    from lab.evals.drivers import gpqa
+
+    rows = [
+        {"Record ID": f"rec{i}", "Question": f"Question {i}?", "Correct Answer": "right",
+         "Incorrect Answer 1": "wrong 1", "Incorrect Answer 2": "wrong 2", "Incorrect Answer 3": "wrong 3", "Extra": "x"}
+        for i in range(20)
+    ]
+    csv_path = tmp_path / "gpqa_diamond.csv"
+    with open(csv_path, "w", newline="") as fh:
+        writer = __import__("csv").DictWriter(fh, fieldnames=list(rows[0]))
+        writer.writeheader()
+        writer.writerows(rows)
+    monkeypatch.setattr(gpqa, "_download", lambda revision: csv_path)
+    monkeypatch.setattr(gpqa, "_revision", lambda: "abc123")
+
+    subset = gpqa.GpqaDiamond().subset()
+    again = gpqa.GpqaDiamond().subset()
+    assert [t.answer for t in subset.tasks] == [t.answer for t in again.tasks], "the same order every run"
+    assert len({t.answer for t in subset.tasks}) > 1, "the correct option isn't always in one place"
+    assert subset.source["revision"] == "abc123"
+    first = subset.tasks[0]
+    assert f"{first.answer}) right" in first.messages[0]["content"]
+
+    driver = gpqa.GpqaDiamond()
+    other = next(c for c in "ABCD" if c != first.answer)
+    assert driver.grade(first, f"Answer: {first.answer}").passed
+    assert driver.grade(first, f"**Answer:** ({first.answer})").passed
+    assert driver.grade(first, f"The answer is {first.answer}.").passed
+    assert not driver.grade(first, f"Answer: {first.answer}\n\nOn reflection...\nAnswer: {other}").passed, "the last one wins"
+    assert driver.grade(first, "Answer: Dopamine").extracted is None
+    assert gpqa.extract_letter("answer: $c$") == "C"
