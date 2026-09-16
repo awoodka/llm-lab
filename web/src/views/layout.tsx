@@ -50,7 +50,7 @@ export type ScoreboardRow = {
 export type Tab = 'home' | 'benchmarks';
 
 const DEFAULT_DESCRIPTION =
-  'Open-weight language models benchmarked on a single RTX 3090: generation and prompt speed as context grows, VRAM, GPU power and tokens per joule.';
+  'Open-weight language models ranked on a single RTX 3090 for coding, tool use and reasoning, with the speed behind the ranking: generation and prompt speed as context grows, VRAM and tokens per joule.';
 
 /** Page shell: header nav, Open Graph tags, and the chart scripts only on pages that draw charts. */
 export const Layout = (props: {

@@ -16,7 +16,7 @@ import { StatusLine } from '../views/status.tsx';
 const MAX_SLOTS = 8;
 
 const INTRO =
-  "Local Inference is my lab for running open-weight language models on a single RTX 3090. I tune each model's settings (context length, KV-cache precision, offload) and measure what the card actually delivers: generation and prompt speed as context fills up, peak VRAM, GPU power and tokens per joule. Every number comes from a scripted, hash-locked config, so results are reproducible.";
+  "Local Inference is my lab for running open-weight language models on a single RTX 3090. I tune each model's settings (context length, KV-cache precision, offload), then rank them on the work I actually want done: writing code, driving tools, reasoning. Speed counts here because it buys thinking time, not because a quick answer is worth more \u2014 every answer has to finish inside a token allowance taken from that config's own measured speed. Every number comes from a scripted, hash-locked config, so results are reproducible.";
 
 type Row = { m: ModelView; cfg: ConfigView; h: Headline };
 
@@ -205,7 +205,7 @@ export function pageRoutes(db: Db, probe: ProbeFn) {
           </article>
           <article class="card">
             <h2>Benchmarks</h2>
-            <p>Every model and config side by side: speed as the context fills, VRAM, power and efficiency, with the exact launch command for each.</p>
+            <p>Every model and config ranked for coding work, and the speed behind that ranking: generation as the context fills, VRAM, power and efficiency, with the exact launch command for each.</p>
             <a class="button primary" href="/benchmarks">View benchmarks →</a>
           </article>
         </section>
