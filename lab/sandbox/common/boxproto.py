@@ -87,7 +87,9 @@ def _jsonable(kwargs: dict[str, Any]) -> dict[str, Any]:
         if v is None or type(v).__name__ in ("NotGiven", "Omit"):
             continue
         out[k] = v
-    return json.loads(json.dumps(out, default=lambda o: o.model_dump() if hasattr(o, "model_dump") else str(o)))
+    # Pydantic messages (a harness may put the SDK's own reply objects back into the history) are dumped
+    # the way the SDK itself sends them.
+    return json.loads(json.dumps(out, default=lambda o: o.model_dump(exclude_unset=True, mode="json") if hasattr(o, "model_dump") else str(o)))
 
 
 class ChannelOpenAI:
@@ -112,3 +114,26 @@ class ChannelOpenAI:
         reply = self._channel.chat(body)
         self.requests.append({"request": body, "reply": reply})
         return ChatCompletion.model_validate(reply)
+
+    def transcript(self) -> dict[str, Any]:
+        """The task's conversation, once: every request re-sends the history, so keep the last one whole.
+
+        `messages` is the last request's history plus its reply; `tools` is the first request's list;
+        `requests` has each request's size and how it ended.
+        """
+        if not self.requests:
+            return {"messages": [], "requests": []}
+        first, last = self.requests[0], self.requests[-1]
+        final = (last["reply"].get("choices") or [{}])[0].get("message")
+        return {
+            "tools": first["request"].get("tools"),
+            "messages": last["request"].get("messages", []) + ([final] if final else []),
+            "requests": [
+                {
+                    "messages": len(r["request"].get("messages", [])),
+                    "usage": r["reply"].get("usage"),
+                    "finish_reason": (r["reply"].get("choices") or [{}])[0].get("finish_reason"),
+                }
+                for r in self.requests
+            ],
+        }

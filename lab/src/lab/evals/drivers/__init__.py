@@ -6,4 +6,8 @@ def get_driver(key: str) -> Driver:
         from lab.evals.drivers.aime import Aime2025
 
         return Aime2025()
+    if key == "bfcl":
+        from lab.evals.drivers.bfcl import Bfcl
+
+        return Bfcl()
     raise NotImplementedError(f"benchmark {key!r} has no driver yet")

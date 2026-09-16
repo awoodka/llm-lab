@@ -147,3 +147,15 @@ def test_the_committed_aime_pin_matches_the_dataset():
     assert len(subset.tasks) == 30
     check_against_pin("aime_2025", subset)
     assert json.loads((__import__("lab.paths", fromlist=["x"]).SUBSETS / "aime_2025.json").read_text())["task_ids"][0] == "aime_2025/I-1"
+
+
+def test_the_bfcl_subset_is_stratified_interleaved_and_matches_its_pin():
+    from lab.evals.drivers.bfcl import CATEGORIES, PER_CATEGORY, Bfcl
+    from lab.evals.drivers.base import load_pin
+
+    sizes = {"simple_python": 400, "multiple": 200, "parallel": 200, "parallel_multiple": 200, "multi_turn_base": 200}
+    listing = [{"id": f"{c}_{i}", "meta": {"category": c}} for c, n in sizes.items() for i in range(n)]
+    chosen = Bfcl().select(listing)
+    assert len(chosen) == PER_CATEGORY * len(CATEGORIES)
+    assert [t["meta"]["category"] for t in chosen[:5]] == list(CATEGORIES), "a --limit smoke test touches every category"
+    assert [t["id"] for t in chosen] == load_pin("bfcl")["task_ids"], "the committed pin is what the seed draws"
