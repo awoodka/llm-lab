@@ -96,8 +96,21 @@ export const Methodology = (props: { hardware: Record<string, any>[]; builds: Re
         times fixed token counts without a chat template.
       </li>
       <li>
-        Code written by a model during a benchmark runs inside a container with no network access, never on the machine
-        itself.
+        AIME 2025 and GPQA Diamond are graded by the lab: the boxed integer, and the last "Answer: X" line of the answer.
+        LiveCodeBench and BFCL run their own published code for prompts and grading (LiveCodeBench at a pinned commit,
+        bfcl-eval 2026.3.23); the lab only passes the conversation to the model and back.
+      </li>
+      <li>
+        LiveCodeBench uses the 100 newest problems of its v6 release, from 15 February to 6 April 2025. BFCL uses 80 cases
+        from each of five categories: simple, multiple, parallel, parallel-multiple and multi-turn.
+      </li>
+      <li>
+        BFCL calls tools natively when a model's chat template supports them. Otherwise it uses BFCL's prompting mode, which
+        lists the functions in the system prompt, and the result says which mode ran.
+      </li>
+      <li>
+        Code a model writes during a benchmark runs in a locked-down container with no network access, separate from the
+        model server.
       </li>
     </ul>
 
@@ -111,6 +124,11 @@ export const Methodology = (props: { hardware: Record<string, any>[]; builds: Re
       <li>Allowance = (time limit − time to read the prompt) × generation speed at that prompt's depth, capped by the context left.</li>
       <li>Both figures come from the config's published speed run, so the budget is fixed before the benchmark starts and never drifts with load.</li>
       <li>Thinking tokens count against it. An answer that doesn't finish inside its allowance is wrong.</li>
+      <li>
+        A task that takes several requests, such as a multi-turn BFCL case, shares one time limit. Each request is charged
+        for the prompt tokens the server hadn't already cached and for its output, at the measured speeds, and the next
+        request gets what's left.
+      </li>
       <li>A faster config gets more room to think in the same 5 minutes; a model that finishes early gains nothing from extra speed.</li>
     </ul>
 
@@ -149,7 +167,10 @@ export const Methodology = (props: { hardware: Record<string, any>[]; builds: Re
         the error bars and shared ranks are for.
       </li>
       <li>Each config is benchmarked with one sampling setup, the one it serves chat with. Another setting might score differently.</li>
-      <li>Models may have seen these public benchmarks during training, which would flatter them.</li>
+      <li>
+        Models may have seen these public benchmarks during training, which would flatter them. The LiveCodeBench problems
+        date from early 2025, so models trained after that are the most likely to have seen them.
+      </li>
       <li>Only configs worth the overnight time get the deep tier, so most are ranked on the quick tier alone.</li>
       <li>Output quality (perplexity, KL divergence) isn't measured yet.</li>
     </ul>
