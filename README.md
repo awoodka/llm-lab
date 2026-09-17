@@ -52,7 +52,7 @@ visitor → Cloudflare (Access on chat.* only) → cloudflared → caddy on web'
             localinference.alexwoodka.com → llmlab-site:3000        pages only
             chat.alexwoodka.com           → llmlab-open-webui:8080  Caddy also requires the Access JWT header
 ai  → https://web.example-tailnet.ts.net (tailscale serve) → 127.0.0.1:3000 → site API listener (:3100)   lab publish / promote / pause
-web → https://ai.example-tailnet.ts.net:8443 → llama-server on ai                                            chat, status probe
+web → https://ai.example-tailnet.ts.net:8443 → the hosted model's server on ai                                chat, status probe
 ```
 
 ## One-time setup (needs you: sudo, the Proxmox host or a dashboard)
@@ -105,6 +105,54 @@ In **Cloudflare Zero Trust**, in this order, so the chat is never reachable with
    Include → Emails → `you@example.com`, session duration 1 week, no Bypass, Service Auth or Everyone rules.
 3. Networks → Tunnels → the edge tunnel → Public hostnames: `localinference.alexwoodka.com` → `http://caddy:80`, and
    `chat.alexwoodka.com` → `http://caddy:80` with **Protect with Access** enabled.
+
+## The vLLM engine (Qwen3.8 27B, speculative decoding)
+
+`llama.cpp` runs every GGUF. The second engine is a **pinned clone of
+[syv-ai/qwen38-27b-rtx3090](https://github.com/syv-ai/qwen38-27b-rtx3090)** — patched vLLM 0.28.0 with a W4A16
+AutoRound checkpoint and a DFlash2 draft model — which serves Qwen3.8 27B about five times faster than the Q4_K_M
+GGUF on the same card (146 t/s against 30.6 t/s of chat generation).
+
+```
+~/qwen-serving -> ~/qwen-serving-bae2023      the pin; an upgrade is a NEW clone, venv and config slug, then a symlink flip
+  venv/                                       its own uv venv (Python 3.12); `ai` itself stays free of torch
+  single-user/start_qwen.sh                   the launcher; the lab sets every knob as an env var and never calls `vllm serve`
+  models/ -> /mnt/models/qwen-serving/models  the W4A16 weights and the DFlash2 draft
+```
+
+- A config pins `launcher_commit`. `lab doctor` checks the pin, the patch series, the weights, the draft and the CUDA
+  toolkit; a checkout that has drifted, or that grew an `api_key.txt`, refuses to start.
+- The launcher binds `0.0.0.0` by default, so the lab always passes `HOST`. It never sends an API key.
+- `CUDA_HOME` is part of the launch environment: flashinfer JIT-compiles kernels on a config's first boot, and through
+  the `/usr/bin/nvcc` symlink it would look for CUDA headers in `/usr` and fail. Override with `LAB_CUDA_HOME`.
+- The first boot of a config compiles for a few minutes; later boots take about a minute. Never wipe
+  `~/.cache/vllm/torch_compile_cache` or `~/.cache/flashinfer` — an env change already recompiles what it must.
+- VRAM is preallocated (`gpu_util`, a fixed KV pool), so the card must be empty before boot. `lab gpu run` takes the
+  lock, pauses chat, runs a command in its own process group and restores chat afterwards.
+
+```sh
+uv run lab bench qwen3.8-27b-w4a16-autoround-fast/64k-dflash2      # --http is the default for vLLM
+uv run lab promote qwen3.8-27b-w4a16-autoround-fast/64k-dflash2    # rolls back on its own if it never gets healthy
+```
+
+Then set the default model in Open WebUI (Admin → Settings → Models) so new chats use it.
+
+**Rollback:** `lab promote qwen3.8-27b-q4_k_m-gguf/64k-q8kv` (about 20 s to boot) and reset Open WebUI's default
+model; for the stack itself, point `~/qwen-serving` back at the previous clone; `lab unpublish <run>` removes
+published numbers. The weights live in `/mnt/models/qwen-serving`.
+
+### Benchmarks: two methods, never mixed
+
+- `lab bench <ref> --speed` is llama-bench: llama.cpp only, no chat template, short generations, and it sweeps context
+  depth. It answers "how fast is this engine at depth N".
+- `lab bench <ref> --http` is `chat-c1-v1`, any engine: eight real chat prompts through the server's own
+  OpenAI-compatible API, one at a time, a discarded warmup and then a sampled and a greedy cohort, 1024 tokens each
+  with thinking off. TTFT is the first content delta; TPOT spreads first-to-last delta over the server's token count,
+  never over chunks, because speculative decoding packs several tokens into one. Every request must be cold, so vLLM
+  gets a fresh `cache_salt` and llama.cpp gets `cache_prompt: false`.
+
+The same model measures ~33 t/s under llama-bench and ~30.6 t/s over HTTP; both are right, and the site keeps them in
+separate columns. Compare engines only through the HTTP method.
 
 ## Deploying the site
 
