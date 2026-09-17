@@ -5,7 +5,7 @@ seeded by its record id, so every run and every model sees the same order. The l
 answer (`content`), never from a model's thinking; the last "Answer: X" wins.
 
 The dataset is gated on Hugging Face: accept its terms and give the lab a token (HF_TOKEN, or
-`huggingface-cli login`). Its revision is resolved once, by `lab eval-pin gpqa_diamond`, and every later
+`uv run hf auth login` in lab/). Its revision is resolved once, by `lab eval-pin gpqa_diamond`, and every later
 run reads the questions at the revision in the pin. Questions never leave the machine: runs publish ids
 and verdicts only, as the dataset's authors ask.
 """
@@ -50,7 +50,7 @@ def _download(revision: str) -> Path:
     except GatedRepoError as e:
         raise PermissionError(
             f"{REPO} is gated: accept its terms on huggingface.co with your account, then set HF_TOKEN "
-            "or run `huggingface-cli login`"
+            "or run `uv run hf auth login` in lab/"
         ) from e
 
 
