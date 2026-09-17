@@ -919,7 +919,10 @@ const Capability = (props: { cfg: ConfigView; scored?: ScoredConfig }) => {
                   <td class="num">{num(metric('eval_allowance_tokens'), 0)}</td>
                   <td class="num">{num(metric('eval_length_stops'), 0)}</td>
                   <td class="num">{num(metric('eval_seconds_per_task'), 0)}</td>
-                  <td>{e?.harness ?? DASH}{e?.harness_version ? <span class="muted small"> {e.harness_version}</span> : ''}</td>
+                  <td>
+                    {e?.harness ?? DASH}{e?.harness_version ? <span class="muted small"> {e.harness_version}</span> : ''}
+                    {harnessMode(e) ? <div class="muted small">{harnessMode(e)}</div> : ''}
+                  </td>
                   <td>{e && run ? <a href={`/runs/${run.id}`}>{date(run.started_at)}</a> : DASH}</td>
                 </tr>
               );
@@ -932,6 +935,14 @@ const Capability = (props: { cfg: ConfigView; scored?: ScoredConfig }) => {
       )}
     </>
   );
+};
+
+/** How a harness was run, when that changes what the number means. BFCL's two modes are not one column. */
+const harnessMode = (e: { gen_kwargs: Record<string, unknown> | null } | undefined | null): string | null => {
+  const mode = e?.gen_kwargs?.mode;
+  if (mode === 'FC') return 'native tool calls';
+  if (mode === 'prompting') return 'prompting mode';
+  return typeof mode === 'string' ? mode : null;
 };
 
 const EvalTable = (props: { evals: EvalRow[] }) => (
@@ -947,7 +958,10 @@ const EvalTable = (props: { evals: EvalRow[] }) => (
             <td class="num">{e.stderr != null ? `${num(e.stderr * 100, 1)}%` : DASH}</td>
             <td class="num">{e.n_tasks ?? e.n_samples ?? DASH}</td>
             <td class="num">{e.attempts_per_task ?? DASH}</td>
-            <td>{e.harness ?? DASH}{e.harness_version ? ` ${e.harness_version}` : ''}</td>
+            <td>
+              {e.harness ?? DASH}{e.harness_version ? ` ${e.harness_version}` : ''}
+              {harnessMode(e) ? <div class="muted small">{harnessMode(e)}</div> : ''}
+            </td>
             <td><code class="small">{e.subset_id ?? DASH}</code></td>
           </tr>
         ))}

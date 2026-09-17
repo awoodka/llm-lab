@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { bundle, evalsBundle } from './fixtures.ts';
+import { bundle, evalsBundle, vllmBundle } from './fixtures.ts';
 import { IngestBody } from '../src/contract.ts';
 import { openDb } from '../src/db.ts';
 import { ingest } from '../src/routes/api.ts';
@@ -86,4 +86,31 @@ test('vllm is a known engine, and a chat-benchmark run never hides the llama-ben
   assert.equal(cfg.speed?.metrics[0].method, 'llama-bench');
   assert.equal(cfg.chat?.metrics[0].method, 'http-sampled');
   assert.notEqual(cfg.speed?.id, cfg.chat?.id);
+});
+
+test('a vLLM config can be scored, and the BFCL mode comes back with the result', () => {
+  const db = openDb(':memory:');
+  ingest(db, vllmBundle(), false);                // the chat benchmark that sizes its allowance
+  ingest(db, evalsBundle({ vllm: true, configHash: 'hash-vllm', configSlug: '64k-dflash2' }), false);
+
+  const cfg = getModel(db, 'qwen3.8-27b-w4a16-autoround-fast')!.configs[0];
+  const bfcl = cfg.evalsQuick!.evals.find((e) => e.task === 'bfcl')!;
+  assert.deepEqual(bfcl.gen_kwargs, { mode: 'FC' }, 'native tool calls, not prompting mode');
+  assert.equal(cfg.speed, null, 'vLLM has no llama-bench run');
+  assert.ok(cfg.chat, 'its speed record is the chat benchmark');
+});
+
+test('two rows can disagree about how the same benchmark was run', () => {
+  const db = openDb(':memory:');
+  ingest(db, bundle(), false);
+  ingest(db, evalsBundle(), false);
+  ingest(db, vllmBundle(), false);
+  ingest(db, evalsBundle({ vllm: true, configHash: 'hash-vllm', configSlug: '64k-dflash2', sha: 'evals-vllm',
+                          runId: 'cccccccc-dddd-4eee-8fff-000000000000' }), false);
+
+  const mode = (slug: string, model: string) =>
+    (getModel(db, model)!.configs.find((c) => c.slug === slug)!.evalsQuick!.evals
+      .find((e) => e.task === 'bfcl')!.gen_kwargs as { mode: string } | null)?.mode;
+  assert.equal(mode('64k-dflash2', 'qwen3.8-27b-w4a16-autoround-fast'), 'FC');
+  assert.equal(mode('default', 'gemma-3-4b-it-q4_k_m-gguf'), 'prompting', 'the site keeps both, so a reader can see why they differ');
 });

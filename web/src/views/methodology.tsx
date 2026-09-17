@@ -102,6 +102,11 @@ export const Methodology = (props: { hardware: Record<string, any>[]; builds: Re
       (<code>-ncmoe</code>) and how weights are loaded. For vLLM: context length, KV-cache pool size, request slots,
       speculative decoding and prefix caching, with the serving scripts pinned to one commit.
     </p>
+    <p>
+      A benchmark never chooses how a model samples: those fields are stripped from every request, so what runs is what
+      the config was launched with. Each run records that setting as the server reports it. llama.cpp is asked directly;
+      vLLM does not expose it, so its record comes from the model's own generation config plus any override in the launch.
+    </p>
     <p>Configs are hash-locked: changing any setting creates a new config instead of quietly rewriting published results.</p>
 
     <h2>A clean GPU for every run</h2>
@@ -160,8 +165,10 @@ export const Methodology = (props: { hardware: Record<string, any>[]; builds: Re
         from each of five categories: simple, multiple, parallel, parallel-multiple and multi-turn.
       </li>
       <li>
-        BFCL calls tools natively when a model's chat template supports them. Otherwise it uses BFCL's prompting mode, which
-        lists the functions in the system prompt, and the result says which mode ran.
+        BFCL calls tools natively when the model's server can, and otherwise uses BFCL's prompting mode, which lists the
+        functions in the system prompt. Every result says which mode ran, and two rows only compare directly when their
+        modes match: prompting mode asks a model to imitate a format it was never trained to emit, which costs it most
+        on the parallel and multi-turn cases.
       </li>
       <li>
         Code a model writes during a benchmark runs in a locked-down container with no network access, separate from the
@@ -178,6 +185,11 @@ export const Methodology = (props: { hardware: Record<string, any>[]; builds: Re
     <ul>
       <li>Allowance = (time limit − time to read the prompt) × generation speed at that prompt's depth, capped by the context left.</li>
       <li>Both figures come from the config's published speed run, so the budget is fixed before the benchmark starts and never drifts with load.</li>
+      <li>
+        A config with no depth ladder — every engine but llama.cpp, whose llama-bench sweeps context depth — is sized from
+        the chat benchmark's generation speed at an empty context, applied at every depth. Generation slows as context
+        fills, so deep in a long context that budget is generous.
+      </li>
       <li>Thinking tokens count against it. An answer that doesn't finish inside its allowance is wrong.</li>
       <li>
         A task that takes several requests, such as a multi-turn BFCL case, shares one time limit. Each request is charged

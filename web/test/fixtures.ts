@@ -46,6 +46,8 @@ type EvalOverrides = {
   configSlug?: string;
   /** Task key to fraction solved, e.g. { livecodebench: 0.24 }. */
   scores?: Record<string, number>;
+  /** Score the vLLM config instead of the gemma one: no llama-bench ladder, and BFCL in native tool mode. */
+  vllm?: boolean;
 };
 
 const QUICK_SCORES = { livecodebench: 0.24, bfcl: 0.46, gpqa_diamond: 0.31, aime_2025: 0.17 };
@@ -60,7 +62,9 @@ const HARNESS: Record<string, string> = {
 export function evalsBundle(overrides: EvalOverrides = {}) {
   const tier = overrides.tier ?? 'quick';
   const scores = overrides.scores ?? (tier === 'quick' ? QUICK_SCORES : DEEP_SCORES);
-  const base = bundle({ configHash: overrides.configHash, configSlug: overrides.configSlug });
+  const base = overrides.vllm
+    ? vllmBundle({ configHash: overrides.configHash, configSlug: overrides.configSlug })
+    : bundle({ configHash: overrides.configHash, configSlug: overrides.configSlug });
   return IngestBody.parse({
     ...base,
     schema_version: 2,
@@ -90,6 +94,8 @@ export function evalsBundle(overrides: EvalOverrides = {}) {
       subset_id: `${task}-v1:abc123`,
       n_tasks: N_TASKS[task],
       attempts_per_task: task === 'aime_2025' ? 4 : 1,
+      // Which mode BFCL ran in is part of what the number means, not decoration.
+      ...(task === 'bfcl' ? { gen_kwargs: { mode: overrides.vllm ? 'FC' : 'prompting' } } : {}),
     })),
   });
 }

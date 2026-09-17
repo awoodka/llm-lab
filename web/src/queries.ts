@@ -32,6 +32,8 @@ export type EvalRow = {
   subset_id: string | null;
   n_tasks: number | null;
   attempts_per_task: number | null;
+  /** How the harness was run, e.g. BFCL's tool mode. Two rows are only comparable when these match. */
+  gen_kwargs: Record<string, unknown> | null;
 };
 
 export type RunSummary = {
@@ -98,11 +100,12 @@ function toRun(db: Db, r: Row, withTelemetry: boolean): RunSummary {
   const metrics = db
     .prepare('SELECT key, method, n_prompt, n_gen, depth, concurrency, value, stddev, n, unit FROM metrics WHERE run_id = ? ORDER BY key, depth, n_prompt, n_gen')
     .all(r.id) as MetricRow[];
-  const evals = db
+  const evals = (db
     .prepare(`SELECT task, metric, filter, value, stderr, n_samples, limit_n, lm_eval_version,
-                     harness, harness_version, subset_id, n_tasks, attempts_per_task
+                     harness, harness_version, subset_id, n_tasks, attempts_per_task, gen_kwargs_json
               FROM eval_results WHERE run_id = ? ORDER BY task, metric`)
-    .all(r.id) as EvalRow[];
+    .all(r.id) as (Omit<EvalRow, 'gen_kwargs'> & { gen_kwargs_json: string | null })[])
+    .map(({ gen_kwargs_json, ...e }) => ({ ...e, gen_kwargs: gen_kwargs_json ? JSON.parse(gen_kwargs_json) : null }));
   return {
     id: r.id, kind: r.kind, tier: r.tier, started_at: r.started_at, duration_s: r.duration_s, throttled: !!r.throttled,
     cli_args: r.cli_args, lab_version: r.lab_version, engine: r.engine, engine_version: r.engine_version,

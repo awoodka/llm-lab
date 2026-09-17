@@ -328,3 +328,12 @@ test('chat-benchmark pages never show tailnet addresses or local paths', async (
     assert.doesNotMatch(html, /(?<![\w.:/-])\/(home|mnt|srv|root)\//, path);
   }
 });
+
+test('a config page says which mode a tool benchmark ran in', async () => {
+  const db = openDb(':memory:');
+  ingest(db, vllmBundle(), false);
+  ingest(db, evalsBundle({ vllm: true, configHash: 'hash-vllm', configSlug: '64k-dflash2' }), false);
+  const { html } = await get(createPagesApp(db, probe('up')), `/m/${VLLM_MODEL}?c=64k-dflash2`);
+  assert.match(html, /native tool calls/, 'BFCL in FC mode is not the same column as prompting mode');
+  assert.doesNotMatch(html, /prompting mode/);
+});
