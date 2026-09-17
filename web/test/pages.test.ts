@@ -3,7 +3,7 @@ import { afterEach, beforeEach, test } from 'node:test';
 import { createPagesApp } from '../src/app.ts';
 import { openDb, type Db } from '../src/db.ts';
 import { ingest } from '../src/routes/api.ts';
-import { bundle, evalsBundle, probe } from './fixtures.ts';
+import { QWEN_GGUF_MODEL, VLLM_MODEL, bundle, chatBundle, evalsBundle, probe, qwenGgufChatBundle, vllmBundle } from './fixtures.ts';
 
 const CHAT = 'https://chat.example.test';
 const MODEL = 'gemma-3-4b-it-q4_k_m-gguf';
@@ -67,6 +67,7 @@ test('benchmarks, methodology, model and run pages render', async () => {
   assert.match(bench.html, /aria-current="page">Benchmarks</);
   assert.match(bench.html, /Gemma 3 4B IT Q4_K_M/);
   assert.match(bench.html, /means of repeated llama-bench runs/);
+  assert.match(bench.html, /the same eight real prompts sent to every engine/);
   assert.match(bench.html, /chart\.umd\.min\.js/);
 
   const method = await get(app, '/methodology');
@@ -215,5 +216,115 @@ test('every script the pages load is actually served', async () => {
   assert.ok(srcs.has('/static/scoreboard.js'), 'the coding view loads the scoreboard script');
   for (const src of srcs) {
     assert.equal((await app.request(src)).status, 200, src);
+  }
+});
+
+/** Gemma with llama-bench and a chat run, Qwen on llama.cpp and on vLLM with chat runs only. */
+function chatDb(): Db {
+  const db = seeded();
+  ingest(db, chatBundle(), false);
+  ingest(db, vllmBundle(), false);
+  ingest(db, qwenGgufChatBundle(), false);
+  return db;
+}
+
+test('the homepage leads with the fastest chat generation across engines', async () => {
+  const { html } = await get(createPagesApp(chatDb(), probe('up')), '/');
+  assert.match(html, /Fastest chat generation<\/div><div class="tile-value">151<[\s\S]*Gemma 3 4B IT Q4_K_M<\/a> · llama\.cpp/, 'Gemma is the fastest chat config in this fixture');
+  assert.match(html, /Generation at 4k context[\s\S]*160[\s\S]*llama-bench/, 'the depth tile stays llama-bench');
+  assert.match(html, /Best chat efficiency[\s\S]*0\.61/, 'efficiency compares chat runs only: 150.5 / 245');
+  assert.doesNotMatch(html, /Fastest generation</, 'no llama-bench speed tile next to the chat one');
+  assert.match(html, /3<span class="tile-unit"> models/);
+
+  const vllmOnly = openDb(':memory:');
+  ingest(vllmOnly, vllmBundle(), false);
+  const v = await get(createPagesApp(vllmOnly, probe('up')), '/');
+  assert.match(v.html, /Fastest chat generation<\/div><div class="tile-value">124<[\s\S]*Qwen3\.8 27B W4A16 AutoRound \(fast\)<\/a> · vLLM/);
+});
+
+test('the speed table lists vLLM, sorts on chat speed and keeps llama-bench columns apart', async () => {
+  const app = createPagesApp(chatDb(), probe('up'));
+  const { html } = await get(app, '/benchmarks?view=speed');
+  assert.match(html, /Chat t\/s ↓/, 'chat speed is the default sort');
+  assert.match(html, /TTFT ms/);
+  const gemma = html.indexOf('>Gemma 3 4B IT Q4_K_M</a>');
+  const vllm = html.indexOf('>Qwen3.8 27B W4A16 AutoRound (fast)</a>');
+  const gguf = html.indexOf('>Qwen3.8 27B Q4_K_M</a>');
+  assert.ok(gemma > 0 && vllm > gemma && gguf > vllm, 'rows ordered by chat t/s: 150.5, 124.4, 32.7');
+  assert.match(html, /<td class="">vLLM<\/td>/);
+  assert.match(html, /<option value="vllm">vLLM<\/option>/);
+  assert.match(html, /data-chart="chart-chat"/);
+  assert.match(html, /data-chart="chart-tg"/);
+
+  const filtered = await get(app, '/benchmarks?view=speed&engine=vllm');
+  assert.match(filtered.html, /Qwen3\.8 27B W4A16 AutoRound/);
+  assert.doesNotMatch(filtered.html, />Gemma 3 4B IT Q4_K_M<\/a>/);
+  assert.doesNotMatch(filtered.html, /data-chart="chart-tg"/, 'no llama-bench chart without llama-bench rows');
+});
+
+test('configs without a chat run sort after the ones with it, by llama-bench generation', async () => {
+  const db = seeded();
+  ingest(db, bundle({ runId: '5a5a5a5a-1111-4222-8333-444444444444', sha: 'sha-fast', configHash: 'hash-fast', configSlug: 'fast', tg0: 300 }), false);
+  ingest(db, vllmBundle(), false);
+  const { html } = await get(createPagesApp(db, probe('up')), '/benchmarks?view=speed&all=1');
+  const rows = [...html.matchAll(/<td class="num">([\d.,—]+)<\/td><td class="num">[\d,—]+<\/td><td class="num">[\d.,—]+<\/td><td class="num">([\d.,—]+)<\/td>/g)].map((m) => [m[1], m[2]]);
+  assert.deepEqual(rows, [['124', '—'], ['—', '300'], ['—', '176']]);
+});
+
+test('a vLLM model page shows the chat benchmark and no llama-bench sections', async () => {
+  const app = createPagesApp(chatDb(), probe('up'));
+  const { status, html } = await get(app, `/m/${VLLM_MODEL}`);
+  assert.equal(status, 200);
+  assert.match(html, /<h2>Chat benchmark<\/h2>/);
+  assert.doesNotMatch(html, /Speed by context depth/);
+  assert.match(html, /Chat generation<\/div><div class="tile-value">124<[\s\S]*default sampling ± 3\.73/);
+  assert.match(html, /preallocated at startup/);
+  assert.match(html, /<td>default sampling<span class="muted small"> · 8 prompts<\/span><\/td>/);
+  assert.match(html, /<td>greedy/);
+  assert.match(html, /Accepted \/ step/);
+  assert.match(html, /3\.21/);
+  assert.match(html, /Load time 72 s · Peak VRAM 22\.9 GB \(preallocated/);
+  assert.match(html, /data-chart="chart-chat-engines"/, 'the same-base comparison with the llama.cpp Qwen config');
+  assert.match(html, /Qwen3\.8 27B Q4_K_M · 64k-q8kv · llama\.cpp/);
+  assert.doesNotMatch(html, /Gemma 3 4B IT Q4_K_M · default/, 'other base models stay out of the comparison');
+  assert.match(html, /data-chart="chart-chat-power"/, 'telemetry charts come from the chat run');
+  assert.match(html, /<td>chat benchmark<\/td>/, 'run history names the kind of speed run');
+  assert.match(html, /· vLLM · SAFETENSORS W4A16/);
+});
+
+test('a llama.cpp config with both runs shows the chat tiles and keeps its depth charts', async () => {
+  const { html } = await get(createPagesApp(chatDb(), probe('up')), `/m/${MODEL}`);
+  assert.match(html, /Chat generation<\/div><div class="tile-value">151</);
+  assert.match(html, /<h2>Chat benchmark<\/h2>/);
+  assert.match(html, /<h2>Speed by context depth<\/h2>/);
+  assert.match(html, /data-chart="chart-tg-depth"/);
+  assert.doesNotMatch(html, /Accepted \/ step/, 'no accept-length column without speculative decoding');
+  assert.doesNotMatch(html, /data-chart="chart-chat-engines"/, 'one config of this base has a chat run: nothing to compare');
+  assert.match(html, /serving the chat benchmark/);
+  assert.match(html, /<td>speed \(llama-bench\)<\/td>/);
+});
+
+test('a chat-benchmark run page labels its methods', async () => {
+  const { html } = await get(createPagesApp(chatDb(), probe('up')), '/runs/8b8b8b8b-1111-4222-8333-444444444444');
+  assert.match(html, /<td>Kind<\/td><td>chat benchmark<\/td>/);
+  assert.match(html, /<td>default sampling<\/td>/);
+  assert.match(html, /chat-c1-v1/);
+});
+
+test('the methodology explains the chat benchmark and credits its source', async () => {
+  const { html } = await get(createPagesApp(seeded(), probe('up')), '/methodology');
+  assert.match(html, /<h2 id="chat-benchmark">Chat benchmark \(all engines\)<\/h2>/);
+  assert.match(html, /Protocol and prompts adapted from <a href="https:\/\/github\.com\/syv-ai\/qwen38-27b-rtx3090">syv-ai\/qwen38-27b-rtx3090<\/a> \(Apache-2\.0\)/);
+  assert.match(html, /never from counting chunks/);
+  assert.match(html, /250 W and holds its core clock at or below 1,625 MHz/);
+});
+
+test('chat-benchmark pages never show tailnet addresses or local paths', async () => {
+  const app = createPagesApp(chatDb(), probe('up'));
+  for (const path of ['/', '/benchmarks?view=speed&all=1', `/m/${VLLM_MODEL}`, `/m/${QWEN_GGUF_MODEL}`, '/runs/8b8b8b8b-1111-4222-8333-444444444444']) {
+    const { status, html } = await get(app, path);
+    assert.equal(status, 200, path);
+    assert.doesNotMatch(html, /ts\.net/, path);
+    assert.doesNotMatch(html, /(?<![\w.:/-])\/(home|mnt|srv|root)\//, path);
   }
 });

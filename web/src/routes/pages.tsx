@@ -1,10 +1,10 @@
 import { Hono, type Context } from 'hono';
 import type { Db } from '../db.ts';
-import { DASH, date, depthLabel, gb, num, testLabel } from '../format.ts';
+import { DASH, date, depthLabel, engineLabel, gb, methodLabel, num, testLabel } from '../format.ts';
 import {
-  HEADLINE_PROMPT_TOKENS, bestConfig, depthsFor, getHardware, getHosted, getModel, getModels, getPause, getRun,
-  headline, pick, scoredConfigs, siteSummary,
-  type ConfigView, type EvalRow, type Headline, type ModelView, type ScoredConfig,
+  CHAT_COHORTS, HEADLINE_PROMPT_TOKENS, bestConfig, chatHeadline, depthsFor, getHardware, getHosted, getModel, getModels,
+  getPause, getRun, hasSpeed, headline, pick, scoredConfigs, siteSummary,
+  type ChatHeadline, type ConfigView, type EvalRow, type Headline, type MetricRow, type ModelView, type RunSummary, type ScoredConfig,
 } from '../queries.ts';
 import { BENCHMARKS, CATEGORIES, byKey, rank } from '../scoring.ts';
 import { siteConfig } from '../site.ts';
@@ -18,20 +18,32 @@ const MAX_SLOTS = 8;
 const INTRO =
   "Local Inference is my lab for running open-weight language models on a single RTX 3090. I tune each model's settings (context length, KV-cache precision, offload), then rank them on the work I actually want done: writing code, driving tools, reasoning. Speed counts here because it buys thinking time, not because a quick answer is worth more \u2014 every answer has to finish inside a token allowance taken from that config's own measured speed. Every number comes from a scripted, hash-locked config, so results are reproducible.";
 
-type Row = { m: ModelView; cfg: ConfigView; h: Headline };
+type Row = { m: ModelView; cfg: ConfigView; h: Headline; ch: ChatHeadline };
+
+const toRow = (m: ModelView, cfg: ConfigView): Row => ({ m, cfg, h: headline(cfg), ch: chatHeadline(cfg) });
 
 const COLUMNS: { key: string; label: string; numeric?: boolean; value: (r: Row) => number | string | null | undefined; show: (r: Row) => string }[] = [
   { key: 'model', label: 'Model', value: (r) => r.m.name, show: (r) => r.m.name },
-  { key: 'engine', label: 'Engine', value: (r) => r.m.engine, show: (r) => r.m.engine },
+  { key: 'engine', label: 'Engine', value: (r) => engineLabel(r.m.engine), show: (r) => engineLabel(r.m.engine) },
   { key: 'size', label: 'Size', numeric: true, value: (r) => r.m.file_size_bytes, show: (r) => gb(r.m.file_size_bytes) },
   { key: 'config', label: 'Config', value: (r) => r.cfg.name, show: (r) => r.cfg.name },
   { key: 'ctx', label: 'Ctx', numeric: true, value: (r) => r.cfg.params.ctx as number, show: (r) => depthLabel(Number(r.cfg.params.ctx ?? 0)) },
+  { key: 'chat', label: 'Chat t/s', numeric: true, value: (r) => r.ch.decode?.value, show: (r) => num(r.ch.decode?.value) },
+  { key: 'ttft', label: 'TTFT ms', numeric: true, value: (r) => r.ch.ttft?.value, show: (r) => num(r.ch.ttft?.value, 0) },
   { key: 'pp0', label: 'PP t/s', numeric: true, value: (r) => r.h.pp0?.value, show: (r) => num(r.h.pp0?.value) },
   { key: 'tg0', label: 'TG t/s', numeric: true, value: (r) => r.h.tg0?.value, show: (r) => num(r.h.tg0?.value) },
   { key: 'tgDeep', label: 'TG t/s deep', numeric: true, value: (r) => r.h.tgDeep?.value, show: (r) => (r.h.tgDeep ? `${num(r.h.tgDeep.value)} @${depthLabel(r.h.tgDeep.depth)}` : DASH) },
   { key: 'vram', label: 'VRAM', numeric: true, value: (r) => r.h.vram?.value, show: (r) => (r.h.vram ? `${num(r.h.vram.value / 1024, 1)} GB` : DASH) },
   { key: 'tokJ', label: 'Tok/J', numeric: true, value: (r) => r.h.tokJ?.value, show: (r) => num(r.h.tokJ?.value) },
 ];
+
+/** How a run was measured, for history tables and run pages. */
+function runKind(r: Pick<RunSummary, 'kind' | 'tier' | 'metrics'>): string {
+  if (r.kind === 'speed') return r.metrics.some((m) => m.method.startsWith('http')) ? 'chat benchmark' : 'speed (llama-bench)';
+  return `${r.kind}${r.tier ? ` (${r.tier})` : ''}`;
+}
+
+const sd = (m?: MetricRow) => (m?.stddev != null ? `± ${num(m.stddev)}` : undefined);
 
 function modelUrl(m: ModelView, cfg?: ConfigView) {
   return `/m/${encodeURIComponent(m.slug)}${cfg ? `?c=${encodeURIComponent(cfg.slug)}` : ''}`;
@@ -148,6 +160,11 @@ export function pageRoutes(db: Db, probe: ProbeFn) {
     const view = await hosting();
     const { chatUrl } = siteConfig();
     const modelLink = (x?: { m: ModelView; cfg: ConfigView }) => x && <a href={modelUrl(x.m, x.cfg)}>{x.m.name}</a>;
+    const withEngine = (x: { m: ModelView; cfg: ConfigView }) => <>{modelLink(x)} · {engineLabel(x.m.engine)}</>;
+    // The lead speed tile compares like with like: the chat benchmark across engines when there is one.
+    const lead = summary.fastestChat
+      ? { label: 'Fastest chat generation', x: summary.fastestChat }
+      : summary.fastest && { label: 'Fastest generation', x: summary.fastest };
 
     // Capability leads once a config has all six benchmarks; until then the speed tiles stand.
     const ranked = scoredConfigs(models).filter((s) => s.score);
@@ -182,13 +199,20 @@ export function pageRoutes(db: Db, probe: ProbeFn) {
             })}
             {bestNight && <Tile label="Most issues fixed per night" value={num(bestNight.v, 0)} unit="issues" note={modelLink(bestNight.s)} />}
           </section>
-        ) : summary.fastest ? (
+        ) : lead ? (
           <section class="tiles" aria-label="Headline results">
-            <Tile label="Fastest generation" value={num(summary.fastest.metric.value)} unit="t/s" note={modelLink(summary.fastest)} />
+            <Tile label={lead.label} value={num(lead.x.metric.value)} unit="t/s" note={withEngine(lead.x)} />
             {summary.deepest && (
-              <Tile label={`Generation at ${depthLabel(summary.deepest.metric.depth)} context`} value={num(summary.deepest.metric.value)} unit="t/s" note={modelLink(summary.deepest)} />
+              <Tile label={`Generation at ${depthLabel(summary.deepest.metric.depth)} context`} value={num(summary.deepest.metric.value)} unit="t/s" note={<>{modelLink(summary.deepest)} · llama-bench</>} />
             )}
-            {summary.efficient && <Tile label="Best efficiency" value={num(summary.efficient.metric.value)} unit="tok/J" note={modelLink(summary.efficient)} />}
+            {summary.efficient && (
+              <Tile
+                label={summary.efficient.metric.method === 'llama-bench' ? 'Best efficiency' : 'Best chat efficiency'}
+                value={num(summary.efficient.metric.value)}
+                unit="tok/J"
+                note={withEngine(summary.efficient)}
+              />
+            )}
             <Tile label="Benchmarked" value={String(summary.models)} unit={summary.models === 1 ? 'model' : 'models'} note={plural(summary.configs, 'config')} />
           </section>
         ) : (
@@ -205,7 +229,7 @@ export function pageRoutes(db: Db, probe: ProbeFn) {
           </article>
           <article class="card">
             <h2>Benchmarks</h2>
-            <p>Every model and config ranked for coding work, and the speed behind that ranking: generation as the context fills, VRAM, power and efficiency, with the exact launch command for each.</p>
+            <p>Every model and config ranked for coding work, and the speed behind that ranking: chat generation on every engine, generation as the context fills, VRAM, power and efficiency, with the exact launch command for each.</p>
             <a class="button primary" href="/benchmarks">View benchmarks →</a>
           </article>
         </section>
@@ -225,28 +249,36 @@ export function pageRoutes(db: Db, probe: ProbeFn) {
 
     const groups = boardGroups(scoredConfigs(models).filter((s) => matches(s.m)));
     const depth = sharedSpeedDepth(groups);
-    const speedOnly = models.filter(matches).flatMap((m) => m.configs).filter((cfg) => cfg.speed && !cfg.evalsQuick && !cfg.evalsDeep).length;
+    const speedOnly = models.filter(matches).flatMap((m) => m.configs).filter((cfg) => hasSpeed(cfg) && !cfg.evalsQuick && !cfg.evalsDeep).length;
     // Capability is the default view, but an empty scoreboard helps nobody: fall back until it has rows.
     const tab = q.view === 'speed' || (q.view !== 'coding' && groups.length === 0) ? 'speed' : 'coding';
 
     let rows: Row[] = q.all
-      ? models.flatMap((m) => m.configs.filter((cfg) => cfg.speed).map((cfg) => ({ m, cfg, h: headline(cfg) })))
+      ? models.flatMap((m) => m.configs.filter(hasSpeed).map((cfg) => toRow(m, cfg)))
       : models.flatMap((m) => {
           const cfg = bestConfig(m);
-          return cfg ? [{ m, cfg, h: headline(cfg) }] : [];
+          return cfg && hasSpeed(cfg) ? [toRow(m, cfg)] : [];
         });
     rows = rows.filter((r) => matches(r.m));
 
-    const sortCol = COLUMNS.find((col) => col.key === q.sort) ?? COLUMNS.find((col) => col.key === 'tg0')!;
+    // Default order: chat generation, then llama-bench generation for configs without a chat benchmark.
+    const sortCol = COLUMNS.find((col) => col.key === q.sort) ?? COLUMNS.find((col) => col.key === 'chat')!;
     const dir = q.dir === 'asc' ? 1 : q.dir === 'desc' ? -1 : sortCol.numeric ? -1 : 1;
-    rows.sort((a, b) => {
-      const va = sortCol.value(a), vb = sortCol.value(b);
-      if (va == null) return 1;
-      if (vb == null) return -1;
-      return (typeof va === 'number' && typeof vb === 'number' ? va - vb : String(va).localeCompare(String(vb))) * dir;
-    });
+    const tg0 = COLUMNS.find((col) => col.key === 'tg0')!;
+    const compare = (col: typeof sortCol, d: number, a: Row, b: Row): number => {
+      const va = col.value(a), vb = col.value(b);
+      if (va == null || vb == null) return va == null && vb == null ? 0 : va == null ? 1 : -1;
+      return (typeof va === 'number' && typeof vb === 'number' ? va - vb : String(va).localeCompare(String(vb))) * d;
+    };
+    rows.sort((a, b) => compare(sortCol, dir, a, b) || compare(tg0, -1, a, b));
 
     const rowLabel = (r: Row) => (q.all ? `${r.m.name} · ${r.cfg.name}` : r.m.name);
+    const byChat = rows.filter((r) => r.ch.decode).sort((a, b) => b.ch.decode!.value - a.ch.decode!.value);
+    const chatBar: ChartSpec = {
+      type: 'bar-h', unit: 't/s', xLabel: 'tokens / second',
+      categories: byChat.map((r) => `${rowLabel(r)} · ${engineLabel(r.m.engine)}`), links: byChat.map((r) => modelUrl(r.m, r.cfg)),
+      series: [{ label: 'Chat generation', slot: 1, data: byChat.map((r) => r.ch.decode!.value), stddev: byChat.map((r) => r.ch.decode!.stddev) }],
+    };
     const withTg = rows.filter((r) => r.h.tg0);
     const byTg = [...withTg].sort((a, b) => b.h.tg0!.value - a.h.tg0!.value);
     const tgBar: ChartSpec = {
@@ -294,7 +326,7 @@ export function pageRoutes(db: Db, probe: ProbeFn) {
             </p>
 
             <form class="filters" method="get">
-              <label>Engine <select name="engine"><option value="">All</option>{engines.map((e) => <option value={e} selected={q.engine === e}>{e}</option>)}</select></label>
+              <label>Engine <select name="engine"><option value="">All</option>{engines.map((e) => <option value={e} selected={q.engine === e}>{engineLabel(e)}</option>)}</select></label>
               <label>Base model <select name="base"><option value="">All</option>{bases.map(([slug, name]) => <option value={slug} selected={q.base === slug}>{name}</option>)}</select></label>
               <label>Architecture <select name="arch"><option value="">All</option><option value="dense" selected={q.arch === 'dense'}>Dense</option><option value="moe" selected={q.arch === 'moe'}>MoE</option></select></label>
               {tab === 'speed'
@@ -347,7 +379,12 @@ export function pageRoutes(db: Db, probe: ProbeFn) {
               )
             ) : (
               <>
-                <p class="muted small">{q.all ? 'Every benchmarked config.' : 'One row per model, using its fastest config (generation speed, empty context).'} Speeds are means of repeated llama-bench runs on this machine.</p>
+                <p class="muted small">
+                  {q.all ? 'Every benchmarked config.' : 'One row per model, using its fastest config (chat generation where measured, otherwise llama-bench generation at empty context).'}{' '}
+                  Chat t/s and TTFT come from the chat benchmark: the same eight real prompts sent to every engine through its HTTP
+                  API, one at a time, so they compare across engines. PP, TG, VRAM and tok/J are means of repeated llama-bench runs,
+                  which only llama.cpp has.
+                </p>
 
                 <div class="table-wrap">
                   <table class="data">
@@ -371,7 +408,7 @@ export function pageRoutes(db: Db, probe: ProbeFn) {
                             col.key === 'model' ? (
                               <td>
                                 <a href={modelUrl(r.m, r.cfg)}>{r.m.name}</a>
-                                {r.cfg.speed?.throttled && <span class="tag">throttled</span>}
+                                {(r.cfg.speed?.throttled || r.cfg.chat?.throttled) && <span class="tag">throttled</span>}
                                 <div class="muted small">{r.m.quant} · {r.m.base.arch}</div>
                               </td>
                             ) : (
@@ -384,10 +421,17 @@ export function pageRoutes(db: Db, probe: ProbeFn) {
                   </table>
                 </div>
 
-                {withTg.length > 0 && (
+                {(byChat.length > 0 || withTg.length > 0) && (
                   <div class="grid-2">
-                    <Chart id="chart-tg" title="Generation speed" subtitle="Tokens per second at empty context. Click a bar to open the model." spec={tgBar} height={Math.max(160, byTg.length * 36 + 70)} />
-                    <Chart id="chart-size" title="Speed vs weight size" subtitle="Bigger weights mean more memory traffic per token." spec={sizeScatter} />
+                    {byChat.length > 0 && (
+                      <Chart id="chart-chat" title="Chat generation speed" subtitle="Decode tokens per second in the chat benchmark, default sampling, every engine. Click a bar to open the model." spec={chatBar} height={Math.max(160, byChat.length * 36 + 70)} />
+                    )}
+                    {withTg.length > 0 && (
+                      <Chart id="chart-tg" title="Generation speed (llama-bench)" subtitle="Tokens per second at empty context. Click a bar to open the model." spec={tgBar} height={Math.max(160, byTg.length * 36 + 70)} />
+                    )}
+                    {withTg.length > 0 && (
+                      <Chart id="chart-size" title="Speed vs weight size" subtitle="llama-bench generation. Bigger weights mean more memory traffic per token." spec={sizeScatter} />
+                    )}
                   </div>
                 )}
               </>
@@ -405,7 +449,7 @@ export function pageRoutes(db: Db, probe: ProbeFn) {
         title="How it's measured"
         tab="benchmarks"
         path="/methodology"
-        description="How Local Inference benchmarks models on one RTX 3090: llama-bench settings, explicit engine flags, GPU telemetry, power and efficiency, throttling and limits."
+        description="How Local Inference benchmarks models on one RTX 3090: the chat benchmark every engine runs, llama-bench settings, explicit engine flags, GPU telemetry, power and efficiency, throttling and limits."
       >
         <Methodology {...getHardware(db)} />
       </Layout>,
@@ -421,7 +465,9 @@ export function pageRoutes(db: Db, probe: ProbeFn) {
     const cfg = model.configs.find((x) => x.slug === c.req.query('c')) ?? topRanked?.cfg ?? bestConfig(model) ?? model.configs[0];
     if (!cfg) return c.notFound();
     const h = headline(cfg);
+    const ch = chatHeadline(cfg);
     const emphasis = model.configs.length > MAX_SLOTS;
+    const vllm = model.engine === 'vllm';
 
     const paramKeys = [...new Set(model.configs.flatMap((x) => Object.keys(x.params)))];
     const differs = (k: string) => new Set(model.configs.map((x) => JSON.stringify(x.params[k] ?? null))).size > 1;
@@ -446,11 +492,34 @@ export function pageRoutes(db: Db, probe: ProbeFn) {
       };
     };
 
-    const tele = cfg.speed?.telemetry ?? [];
-    const teleChart = (field: string, label: string, unit: string): ChartSpec => ({
+    const teleChart = (run: RunSummary, field: string, label: string, unit: string): ChartSpec => ({
       type: 'line', unit, xLabel: 'seconds into run', yLabel: label,
-      series: [{ label, slot: 1, data: tele.map((s) => ({ x: s.t, y: field === 'vram_mb' ? s[field] / 1024 : s[field] })) }],
+      series: [{ label, slot: 1, data: run.telemetry.map((s) => ({ x: s.t, y: field === 'vram_mb' ? s[field] / 1024 : s[field] })) }],
     });
+    const teleCharts = (run: RunSummary, prefix: string) =>
+      run.telemetry.length > 1 && (
+        <div class="grid-2">
+          <Chart id={`${prefix}-power`} title="GPU power during the run" spec={teleChart(run, 'power_w', 'GPU power', 'W')} height={200} />
+          <Chart id={`${prefix}-vram`} title="VRAM during the run" spec={teleChart(run, 'vram_mb', 'VRAM', 'GB')} height={200} />
+        </div>
+      );
+
+    // Every config of the same base model with a chat benchmark, on any engine: the like-for-like comparison.
+    const sameBase = getModels(db)
+      .filter((m) => m.base.slug === model.base.slug)
+      .flatMap((m) => m.configs.map((x) => ({ m, x, ch: chatHeadline(x) })))
+      .filter((r) => r.ch.decode)
+      .sort((a, b) => b.ch.decode!.value - a.ch.decode!.value);
+    const engineChart: ChartSpec = {
+      type: 'bar-h', unit: 't/s', xLabel: 'decode tokens / second',
+      categories: sameBase.map((r) => `${r.m.name} · ${r.x.name} · ${engineLabel(r.m.engine)}`),
+      links: sameBase.map((r) => modelUrl(r.m, r.x)),
+      series: CHAT_COHORTS.map((method, i) => {
+        const pts = sameBase.map((r) => pick(r.x.chat, 'decode_tps', { method }));
+        return { label: methodLabel(method), slot: i + 1, data: pts.map((p) => p?.value ?? null), stddev: pts.map((p) => p?.stddev ?? null) };
+      }),
+    };
+    const anyAccept = CHAT_COHORTS.some((method) => pick(cfg.chat, 'spec_accept_len', { method }));
 
     const speedRows = (cfg.speed?.metrics ?? []).filter((m) => m.key === 'pp_tps' || m.key === 'tg_tps');
 
@@ -459,7 +528,11 @@ export function pageRoutes(db: Db, probe: ProbeFn) {
         title={model.name}
         tab="benchmarks"
         path={modelUrl(model, cfg)}
-        description={`${model.name} (${cfg.name}) on a single RTX 3090: ${num(h.tg0?.value)} t/s generation at empty context. Launch command, settings, speed by context depth, power and efficiency.`}
+        description={
+          ch.decode
+            ? `${model.name} (${cfg.name}, ${engineLabel(model.engine)}) on a single RTX 3090: ${num(ch.decode.value)} t/s chat generation. Launch command, settings, chat benchmark, power and efficiency.`
+            : `${model.name} (${cfg.name}) on a single RTX 3090: ${num(h.tg0?.value)} t/s generation at empty context. Launch command, settings, speed by context depth, power and efficiency.`
+        }
         charts
         footer={<HardwareFooter {...getHardware(db)} />}
       >
@@ -467,7 +540,7 @@ export function pageRoutes(db: Db, probe: ProbeFn) {
         <h1>{model.name}</h1>
         <p class="meta">
           {model.base.name} · {model.base.arch === 'moe' ? `MoE ${num(model.base.params_b, 1)}B (${num(model.base.active_params_b, 1)}B active)` : model.base.params_b ? `${num(model.base.params_b, 1)}B dense` : 'dense'} ·{' '}
-          {model.engine} · {model.format.toUpperCase()} {model.quant} · {gb(model.file_size_bytes)}
+          {engineLabel(model.engine)} · {model.format.toUpperCase()} {model.quant} · {gb(model.file_size_bytes)}
           {model.source_repo && (
             <> · <a href={`https://huggingface.co/${model.source_repo}`}>{model.source_repo}</a>{model.source_revision && <span class="muted"> @{model.source_revision.slice(0, 7)}</span>}</>
           )}
@@ -480,15 +553,26 @@ export function pageRoutes(db: Db, probe: ProbeFn) {
           ))}
         </nav>
 
-        <section class="tiles">
-          <Tile label="Generation, empty context" value={num(h.tg0?.value)} unit="t/s" note={h.tg0?.stddev != null ? `± ${num(h.tg0.stddev)}` : undefined} />
-          <Tile label={h.tgDeep ? `Generation at ${depthLabel(h.tgDeep.depth)} context` : 'Generation, deep context'} value={num(h.tgDeep?.value)} unit="t/s" />
-          <Tile label="Prompt processing" value={num(h.pp0?.value)} unit="t/s" />
-          <Tile label="Peak VRAM" value={h.vram ? num(h.vram.value / 1024, 1) : DASH} unit="GB" note={h.vram ? 'during llama-bench' : undefined} />
-          <Tile label="GPU power while generating" value={num(h.watts?.value)} unit="W" />
-          <Tile label="Energy efficiency" value={num(h.tokJ?.value)} unit="tok/J" />
-        </section>
-        {cfg.speed?.throttled && <p class="warn">⚠ This run hit thermal or power-brake throttling; numbers may be low.</p>}
+        {cfg.chat ? (
+          <section class="tiles">
+            <Tile label="Chat generation" value={num(ch.decode?.value)} unit="t/s" note={['default sampling', sd(ch.decode)].filter(Boolean).join(' ')} />
+            <Tile label="Chat generation, greedy" value={num(ch.greedy?.value)} unit="t/s" note={sd(ch.greedy)} />
+            <Tile label="Time to first token" value={num(ch.ttft?.value, 0)} unit="ms" />
+            <Tile label="Peak VRAM" value={ch.vram ? num(ch.vram.value / 1024, 1) : DASH} unit="GB" note={ch.vram ? (vllm ? 'preallocated at startup' : 'serving the chat benchmark') : undefined} />
+            <Tile label="GPU power while generating" value={num(ch.watts?.value)} unit="W" />
+            <Tile label="Energy efficiency" value={num(ch.tokJ?.value)} unit="tok/J" note="chat benchmark" />
+          </section>
+        ) : (
+          <section class="tiles">
+            <Tile label="Generation, empty context" value={num(h.tg0?.value)} unit="t/s" note={sd(h.tg0)} />
+            <Tile label={h.tgDeep ? `Generation at ${depthLabel(h.tgDeep.depth)} context` : 'Generation, deep context'} value={num(h.tgDeep?.value)} unit="t/s" />
+            <Tile label="Prompt processing" value={num(h.pp0?.value)} unit="t/s" />
+            <Tile label="Peak VRAM" value={h.vram ? num(h.vram.value / 1024, 1) : DASH} unit="GB" note={h.vram ? 'during llama-bench' : undefined} />
+            <Tile label="GPU power while generating" value={num(h.watts?.value)} unit="W" />
+            <Tile label="Energy efficiency" value={num(h.tokJ?.value)} unit="tok/J" />
+          </section>
+        )}
+        {(cfg.speed?.throttled || cfg.chat?.throttled) && <p class="warn">⚠ A speed run hit thermal or power-brake throttling; its numbers may be low.</p>}
 
         <section>
           <h2>Settings</h2>
@@ -513,9 +597,67 @@ export function pageRoutes(db: Db, probe: ProbeFn) {
           {model.configs.length > 1 && <p class="muted small">Highlighted rows differ between this model's configs.</p>}
         </section>
 
+        {cfg.chat && (
+          <section>
+            <h2>Chat benchmark</h2>
+            <p class="muted small">
+              Eight real chat prompts sent through the server's HTTP API, one at a time, up to 1,024 tokens each, thinking off.
+              Every engine runs the same protocol, so these numbers compare across engines. <a href="/methodology#chat-benchmark">How it's measured</a>
+            </p>
+            <div class="table-wrap">
+              <table class="data">
+                <thead>
+                  <tr>
+                    <th>Sampling</th><th class="num">Decode t/s</th><th class="num">± sd</th><th class="num">TPOT ms</th><th class="num">TTFT ms</th>
+                    <th class="num">Prefill t/s</th><th class="num">End-to-end t/s</th><th class="num">Output tokens</th><th class="num">GPU W</th><th class="num">Tok/J</th>
+                    {anyAccept && <th class="num">Accepted / step</th>}
+                  </tr>
+                </thead>
+                <tbody>
+                  {CHAT_COHORTS.filter((method) => pick(cfg.chat, 'decode_tps', { method })).map((method) => {
+                    const m = (key: string) => pick(cfg.chat, key, { method });
+                    const decode = m('decode_tps');
+                    return (
+                      <tr>
+                        <td>{methodLabel(method)}{decode?.n ? <span class="muted small"> · {decode.n} prompts</span> : ''}</td>
+                        <td class="num">{num(decode?.value)}</td>
+                        <td class="num">{num(decode?.stddev)}</td>
+                        <td class="num">{num(m('tpot_ms')?.value)}</td>
+                        <td class="num">{num(m('ttft_ms')?.value, 0)}</td>
+                        <td class="num">{num(m('prefill_tps')?.value, 0)}</td>
+                        <td class="num">{num(m('e2e_tps')?.value)}</td>
+                        <td class="num">{num(m('out_tokens_mean')?.value, 0)}</td>
+                        <td class="num">{num(m('gpu_w_avg')?.value, 0)}</td>
+                        <td class="num">{num(m('tokens_per_joule')?.value)}</td>
+                        {anyAccept && <td class="num">{num(m('spec_accept_len')?.value)}</td>}
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+            <p class="muted small">
+              Load time {ch.load ? `${num(ch.load.value, 0)} s` : DASH} · Peak VRAM {ch.vram ? `${num(ch.vram.value / 1024, 1)} GB` : DASH}
+              {vllm && ch.vram ? ' (preallocated: vLLM reserves its KV-cache pool at startup)' : ''} · Peak RAM{' '}
+              {ch.ram ? `${num(ch.ram.value / 1024, 1)} GB` : DASH} · <a href={`/runs/${cfg.chat.id}`}>Run of {date(cfg.chat.started_at)}</a>
+            </p>
+            {sameBase.length > 1 && (
+              <Chart
+                id="chart-chat-engines"
+                title={`Chat generation, every ${model.base.name} config`}
+                subtitle="Same prompts and settings on every engine. Click a bar to open that config."
+                spec={engineChart}
+                height={Math.max(180, sameBase.length * 56 + 80)}
+              />
+            )}
+            {!cfg.speed && teleCharts(cfg.chat, 'chart-chat')}
+          </section>
+        )}
+
         {cfg.speed && (
           <section>
-            <h2>Speed</h2>
+            <h2>Speed by context depth</h2>
+            <p class="muted small">llama.cpp's own benchmark, llama-bench, with no server in the loop.</p>
             <div class="grid-2">
               <Chart id="chart-tg-depth" title="Generation vs context depth" subtitle={model.configs.length > 1 ? 'All configs of this model; the selected one is solid.' : undefined} spec={depthChart('tg_tps')} />
               <Chart id="chart-pp-depth" title="Prompt processing vs context depth" spec={depthChart('pp_tps')} />
@@ -541,12 +683,7 @@ export function pageRoutes(db: Db, probe: ProbeFn) {
                 </tbody>
               </table>
             </div>
-            {tele.length > 1 && (
-              <div class="grid-2">
-                <Chart id="chart-power" title="GPU power during the run" spec={teleChart('power_w', 'GPU power', 'W')} height={200} />
-                <Chart id="chart-vram" title="VRAM during the run" spec={teleChart('vram_mb', 'VRAM', 'GB')} height={200} />
-              </div>
-            )}
+            {teleCharts(cfg.speed, 'chart')}
           </section>
         )}
 
@@ -573,7 +710,7 @@ export function pageRoutes(db: Db, probe: ProbeFn) {
                 {cfg.history.map((r) => (
                   <tr>
                     <td><a href={`/runs/${r.id}`}>{date(r.started_at)}</a></td>
-                    <td>{r.kind}{r.tier ? ` (${r.tier})` : ''}</td>
+                    <td>{runKind(r)}</td>
                     <td><code>{r.engine}@{r.commit_sha ?? '?'}</code></td>
                     <td>{r.driver}</td>
                     <td class="num">{r.duration_s != null ? `${num(r.duration_s / 60, 1)} min` : DASH}</td>
@@ -599,7 +736,7 @@ export function pageRoutes(db: Db, probe: ProbeFn) {
         <div class="table-wrap">
           <table class="data params">
             <tbody>
-              <tr><td>Kind</td><td>{run.kind}{run.tier ? ` (${run.tier})` : ''}</td></tr>
+              <tr><td>Kind</td><td>{runKind(run)}</td></tr>
               <tr><td>Started</td><td>{date(run.started_at)} UTC</td></tr>
               <tr><td>Duration</td><td>{run.duration_s != null ? `${num(run.duration_s, 0)} s` : DASH}</td></tr>
               <tr><td>Engine</td><td><code>{run.engine}@{run.commit_sha}</code> (build {run.engine_version ?? '?'})</td></tr>
@@ -635,7 +772,7 @@ const MetricTable = (props: { metrics: { key: string; method: string; n_prompt: 
         {props.metrics.map((m) => (
           <tr>
             <td><code>{m.key}</code></td>
-            <td>{m.method}</td>
+            <td>{methodLabel(m.method)}</td>
             <td class="num">{m.n_prompt || DASH}</td>
             <td class="num">{m.n_gen || DASH}</td>
             <td class="num">{depthLabel(m.depth)}</td>

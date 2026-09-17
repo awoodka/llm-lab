@@ -234,17 +234,50 @@ export type Headline = {
   watts?: MetricRow;
 };
 
+/** llama-bench numbers of a config. Every pick names the method, so a chat-benchmark number never stands in. */
 export function headline(cfg: ConfigView): Headline {
   const s = cfg.speed;
+  const lb = { method: 'llama-bench' };
   const tgDepths = depthsFor(s, 'tg_tps');
   const deepest = tgDepths.at(-1);
   return {
-    pp0: pick(s, 'pp_tps', { depth: 0 }),
-    tg0: pick(s, 'tg_tps', { depth: 0 }),
-    tgDeep: deepest ? pick(s, 'tg_tps', { depth: deepest }) : undefined,
-    vram: pick(s, 'vram_peak_mb'),
-    tokJ: pick(s, 'tokens_per_joule', { depth: 0, n_prompt: 0 }),
-    watts: pick(s, 'gpu_w_avg', { depth: 0, n_prompt: 0 }),
+    pp0: pick(s, 'pp_tps', { ...lb, depth: 0 }),
+    tg0: pick(s, 'tg_tps', { ...lb, depth: 0 }),
+    tgDeep: deepest ? pick(s, 'tg_tps', { ...lb, depth: deepest }) : undefined,
+    vram: pick(s, 'vram_peak_mb', lb),
+    tokJ: pick(s, 'tokens_per_joule', { ...lb, depth: 0, n_prompt: 0 }),
+    watts: pick(s, 'gpu_w_avg', { ...lb, depth: 0, n_prompt: 0 }),
+  };
+}
+
+/** The chat benchmark's cohorts: the model's default sampling (what pages lead with) and greedy decoding. */
+export const CHAT_COHORTS = ['http-sampled', 'http-greedy'] as const;
+
+export type ChatHeadline = {
+  /** Decode t/s under default sampling: the like-for-like number across engines. */
+  decode?: MetricRow;
+  greedy?: MetricRow;
+  ttft?: MetricRow;
+  tokJ?: MetricRow;
+  watts?: MetricRow;
+  load?: MetricRow;
+  vram?: MetricRow;
+  ram?: MetricRow;
+};
+
+/** Chat-benchmark numbers of a config (its latest HTTP run). */
+export function chatHeadline(cfg: ConfigView): ChatHeadline {
+  const r = cfg.chat;
+  const sampled = { method: 'http-sampled' };
+  return {
+    decode: pick(r, 'decode_tps', sampled),
+    greedy: pick(r, 'decode_tps', { method: 'http-greedy' }),
+    ttft: pick(r, 'ttft_ms', sampled),
+    tokJ: pick(r, 'tokens_per_joule', sampled),
+    watts: pick(r, 'gpu_w_avg', sampled),
+    load: pick(r, 'load_s', { method: 'http' }),
+    vram: pick(r, 'vram_peak_mb', { method: 'http' }),
+    ram: pick(r, 'ram_peak_mb', { method: 'http' }),
   };
 }
 
@@ -282,11 +315,14 @@ function evalScores(run: RunSummary | null): Record<string, BenchScore> {
   return out;
 }
 
-/** Generation speed by depth for the allowance, preferring llama-bench's depth ladder. */
+/**
+ * Generation speed by depth for the allowance, preferring llama-bench's depth ladder. Without one, the chat
+ * benchmark's default-sampling decode speed stands in: it is how the config serves chat.
+ */
 function speedPoints(cfg: ConfigView): SpeedPoint[] {
-  const run = cfg.speed ?? cfg.chat;
+  const [run, key, method] = cfg.speed ? [cfg.speed, 'tg_tps', 'llama-bench'] : [cfg.chat, 'decode_tps', 'http-sampled'];
   return (run?.metrics ?? [])
-    .filter((m) => m.key === 'tg_tps' || m.key === 'decode_tps')
+    .filter((m) => m.key === key && m.method === method)
     .map((m) => ({ depth: m.depth, tps: m.value }));
 }
 
@@ -306,10 +342,14 @@ export function scoredConfigs(models: ModelView[]): ScoredConfig[] {
       const deepUsable = deepRun && !deepRun.throttled ? deepRun : null;
       const scores = { ...evalScores(quickRun), ...evalScores(deepUsable) };
       const speedRun = cfg.speed ?? cfg.chat;
-      const depths = depthsFor(speedRun, 'tg_tps');
+      const depths = depthsFor(cfg.speed, 'tg_tps');
       const deepest = depths.at(-1);
-      const speed = deepest != null ? pick(speedRun, 'tg_tps', { depth: deepest }) : pick(speedRun, 'decode_tps');
-      const promptSpeed = pick(speedRun, 'pp_tps', { depth: 0 }) ?? pick(speedRun, 'prefill_tps');
+      const speed = deepest != null
+        ? pick(cfg.speed, 'tg_tps', { method: 'llama-bench', depth: deepest })
+        : pick(cfg.chat, 'decode_tps', { method: 'http-sampled' });
+      const promptSpeed = cfg.speed
+        ? pick(cfg.speed, 'pp_tps', { method: 'llama-bench', depth: 0 })
+        : pick(cfg.chat, 'prefill_tps', { method: 'http-sampled' });
       const ctx = Number(cfg.params.ctx ?? 0);
       const points = speedPoints(cfg);
       const rawAllowance =
@@ -326,7 +366,7 @@ export function scoredConfigs(models: ModelView[]): ScoredConfig[] {
         quick: quickScore(scores),
         speed,
         promptSpeed,
-        vram: pick(speedRun, 'vram_peak_mb'),
+        vram: pick(speedRun, 'vram_peak_mb', { method: cfg.speed ? 'llama-bench' : 'http' }),
         allowance: rawAllowance,
         allowanceCapped: rawAllowance != null && rawAllowance === ctx - HEADLINE_PROMPT_TOKENS,
         issuesPerNight:
@@ -338,35 +378,70 @@ export function scoredConfigs(models: ModelView[]): ScoredConfig[] {
   return out;
 }
 
-/** A config whose latest speed run may feed headline numbers: it exists and wasn't throttled. */
+/** A config whose latest llama-bench run may feed headline numbers: it exists and wasn't throttled. */
 export function isUsable(cfg: ConfigView): boolean {
   return !!cfg.speed && !cfg.speed.throttled;
 }
 
-/** The config that represents a model: fastest generation at empty context, preferring non-throttled runs. */
+/** The same for the chat benchmark. */
+export function isChatUsable(cfg: ConfigView): boolean {
+  return !!cfg.chat && !cfg.chat.throttled;
+}
+
+/** A config with any speed numbers: llama-bench, the chat benchmark, or both. */
+export function hasSpeed(cfg: ConfigView): boolean {
+  return !!(cfg.speed || cfg.chat);
+}
+
+/**
+ * The config that represents a model: non-throttled first, then fastest chat generation where it was
+ * measured, then fastest llama-bench generation at empty context.
+ */
 export function bestConfig(model: ModelView): ConfigView | undefined {
+  const usable = (cfg: ConfigView) => Number(isUsable(cfg) || isChatUsable(cfg));
+  const chat = (cfg: ConfigView) => chatHeadline(cfg).decode?.value ?? -1;
   const tg0 = (cfg: ConfigView) => headline(cfg).tg0?.value ?? -1;
-  return [...model.configs].sort((a, b) => Number(isUsable(b)) - Number(isUsable(a)) || tg0(b) - tg0(a))[0];
+  return [...model.configs].sort((a, b) => usable(b) - usable(a) || chat(b) - chat(a) || tg0(b) - tg0(a))[0];
 }
 
 export type Highlight = { m: ModelView; cfg: ConfigView; metric: MetricRow };
 
-export type SiteSummary = { models: number; configs: number; fastest?: Highlight; deepest?: Highlight; efficient?: Highlight };
+export type SiteSummary = {
+  models: number;
+  configs: number;
+  /** Fastest chat generation: the chat benchmark under default sampling, comparable across engines. */
+  fastestChat?: Highlight;
+  /** Fastest llama-bench generation at empty context (llama.cpp only). */
+  fastest?: Highlight;
+  deepest?: Highlight;
+  /** Tokens per joule, from the chat benchmark when any config has one, otherwise from llama-bench. */
+  efficient?: Highlight;
+};
 
-/** Homepage headline numbers. Throttled runs never count. */
+/**
+ * Homepage headline numbers. Throttled runs never count, and each highlight compares one method only:
+ * chat-benchmark numbers with each other, llama-bench numbers with each other.
+ */
 export function siteSummary(models: ModelView[]): SiteSummary {
-  const usable = models.flatMap((m) => m.configs.filter(isUsable).map((cfg) => ({ m, cfg })));
-  const best = (metric: (x: { m: ModelView; cfg: ConfigView }) => MetricRow | undefined): Highlight | undefined =>
-    usable
+  const all = models.flatMap((m) => m.configs.map((cfg) => ({ m, cfg })));
+  const best = (
+    pool: { m: ModelView; cfg: ConfigView }[],
+    metric: (x: { m: ModelView; cfg: ConfigView }) => MetricRow | undefined,
+  ): Highlight | undefined =>
+    pool
       .map((x) => ({ ...x, metric: metric(x) }))
       .filter((x): x is Highlight => x.metric !== undefined)
       .sort((a, b) => b.metric.value - a.metric.value)[0];
-  const deepest = Math.max(0, ...usable.flatMap((x) => depthsFor(x.cfg.speed, 'tg_tps')));
+  const bench = all.filter((x) => isUsable(x.cfg));
+  const chat = all.filter((x) => isChatUsable(x.cfg));
+  const deepest = Math.max(0, ...bench.flatMap((x) => depthsFor(x.cfg.speed, 'tg_tps')));
+  const efficientChat = best(chat, (x) => chatHeadline(x.cfg).tokJ);
   return {
-    models: models.filter((m) => m.configs.some((cfg) => cfg.speed)).length,
-    configs: models.reduce((n, m) => n + m.configs.filter((cfg) => cfg.speed).length, 0),
-    fastest: best((x) => headline(x.cfg).tg0),
-    deepest: deepest > 0 ? best((x) => pick(x.cfg.speed, 'tg_tps', { depth: deepest })) : undefined,
-    efficient: best((x) => headline(x.cfg).tokJ),
+    models: models.filter((m) => m.configs.some(hasSpeed)).length,
+    configs: all.filter((x) => hasSpeed(x.cfg)).length,
+    fastestChat: best(chat, (x) => chatHeadline(x.cfg).decode),
+    fastest: best(bench, (x) => headline(x.cfg).tg0),
+    deepest: deepest > 0 ? best(bench, (x) => pick(x.cfg.speed, 'tg_tps', { method: 'llama-bench', depth: deepest })) : undefined,
+    efficient: efficientChat ?? best(bench, (x) => headline(x.cfg).tokJ),
   };
 }

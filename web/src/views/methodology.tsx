@@ -2,8 +2,8 @@ import { num } from '../format.ts';
 
 /**
  * "How it's measured". Keep in step with the lab code: lab/src/lab/bench/native_llamacpp.py (power per test),
- * lab/src/lab/telemetry.py (sampling, throttle bits), lab/src/lab/gpu/hosted.py (clean start),
- * lab/src/lab/catalog.py (bench defaults, config hash).
+ * lab/src/lab/bench/http_chat.py (chat benchmark), lab/src/lab/telemetry.py (sampling, throttle bits),
+ * lab/src/lab/gpu/hosted.py (clean start), lab/src/lab/catalog.py (bench defaults, config hash).
  */
 export const Methodology = (props: { hardware: Record<string, any>[]; builds: Record<string, any>[] }) => (
   <article class="prose">
@@ -23,16 +23,66 @@ export const Methodology = (props: { hardware: Record<string, any>[]; builds: Re
             CUDA {h.cuda}); {h.cpu_model} with {h.cpu_threads_visible} threads; {Math.round(h.ram_mb / 1024)} GB of RAM.
           </li>
         ))}
+        <li>
+          The host caps the GPU at 250 W and holds its core clock at or below 1,625 MHz from boot, a conservative power
+          setup. Prompt processing gives up a few percent to it; generation speed doesn't change.
+        </li>
         {props.builds.length > 0 && <li>Engine builds: {props.builds.map((b) => `${b.engine}@${b.commit_sha ?? '?'}`).join(', ')}.</li>}
       </ul>
     ) : (
       <p>Hardware details appear here once results are published.</p>
     )}
 
-    <h2>Speed runs</h2>
+    <h2 id="chat-benchmark">Chat benchmark (all engines)</h2>
     <p>
-      Speed comes from llama.cpp's own benchmark tool, <code>llama-bench</code>, running directly on the GPU with no server in
-      the loop. By default each config is tested with:
+      Every config, on every engine, answers the same chat requests through its own HTTP API, the way a chat client talks
+      to it. These are the numbers to compare across engines.
+    </p>
+    <ul>
+      <li><strong>Prompts:</strong> eight real chat prompts, each answered with up to 1,024 tokens, one request at a time, streamed.</li>
+      <li>
+        <strong>Warm before timing:</strong> the server boots, then answers all eight prompts once, and those answers are
+        thrown away. vLLM compiles kernels the first time it boots, so nothing is timed until the server is warm.
+      </li>
+      <li>
+        <strong>Two passes:</strong> default sampling (temperature 1.0, top-p 0.95, top-k 20, the same for every model)
+        and greedy decoding (temperature 0). Pages lead with default sampling.
+      </li>
+      <li>
+        <strong>Thinking off</strong>, so every request times the answer itself. The chat this machine hosts runs with
+        thinking on.
+      </li>
+      <li><strong>Time to first token (TTFT):</strong> from sending the request to the first streamed token.</li>
+      <li>
+        <strong>Time per output token (TPOT)</strong> = (last content chunk − first content chunk) ÷ (completion tokens − 1).
+        The token count comes from the server, never from counting chunks: speculative decoding sends several tokens in one
+        chunk.
+      </li>
+      <li><strong>Decode speed</strong> = 1,000 ÷ mean TPOT in milliseconds. End-to-end speed also counts the wait for the first token.</li>
+      <li>
+        <strong>No cached prompts:</strong> each request gets its own cache salt on vLLM, and llama.cpp runs with prompt
+        caching off. A run that reads anything from a prefix cache fails.
+      </li>
+      <li>
+        <strong>Speculative decoding</strong> drafts several tokens ahead and checks them in one step. How many are accepted
+        depends on the text, so other prompts can run faster or slower; the accepted-per-step column shows the average.
+      </li>
+      <li>
+        <strong>VRAM:</strong> vLLM reserves its whole KV-cache pool when it starts, so its peak VRAM is what it
+        preallocates, not what the requests used.
+      </li>
+      <li>The command line and settings the server actually ran with are recorded with each run, without local paths.</li>
+      <li>Expect a few percent of variation between repeated runs, and up to about 5% for greedy decoding with speculation.</li>
+    </ul>
+    <p class="muted small">
+      Protocol and prompts adapted from <a href="https://github.com/syv-ai/qwen38-27b-rtx3090">syv-ai/qwen38-27b-rtx3090</a> (Apache-2.0).
+    </p>
+
+    <h2>Speed by context depth (llama-bench)</h2>
+    <p>
+      llama.cpp configs also run llama.cpp's own benchmark tool, <code>llama-bench</code>, directly on the GPU with no server
+      in the loop. It shows how speed changes as the context fills, which the chat benchmark doesn't. By default each config
+      is tested with:
     </p>
     <ul>
       <li><strong>Prompt processing:</strong> a 512-token prompt.</li>
@@ -47,9 +97,10 @@ export const Methodology = (props: { hardware: Record<string, any>[]; builds: Re
     <h2>Every setting is explicit</h2>
     <p>
       Each config's exact launch command is on its model page. Settings that an engine would otherwise pick for itself are
-      always pinned: <code>--fit off</code>, parallel slots (<code>-np</code>), <code>--cache-ram 0</code>, flash attention,
-      KV-cache precision, batch and micro-batch size, CPU threads, MoE expert offload (<code>-ncmoe</code>) and how weights
-      are loaded.
+      always pinned. For llama.cpp: <code>--fit off</code>, parallel slots (<code>-np</code>), <code>--cache-ram 0</code>,
+      flash attention, KV-cache precision, batch and micro-batch size, CPU threads, MoE expert offload
+      (<code>-ncmoe</code>) and how weights are loaded. For vLLM: context length, KV-cache pool size, request slots,
+      speculative decoding and prefix caching, with the serving scripts pinned to one commit.
     </p>
     <p>Configs are hash-locked: changing any setting creates a new config instead of quietly rewriting published results.</p>
 
@@ -69,8 +120,12 @@ export const Methodology = (props: { hardware: Record<string, any>[]; builds: Re
         readable from inside the container.
       </li>
       <li>
-        <strong>Peak VRAM</strong> reflects llama-bench's cache sizing for its tests (prompt, generated tokens and depth), not a
-        server holding a full context window.
+        <strong>Peak VRAM</strong> from llama-bench reflects its cache sizing for its tests (prompt, generated tokens and
+        depth), not a server holding a full context window. The chat benchmark measures a real server instead.
+      </li>
+      <li>
+        In the chat benchmark, power and tokens per joule for each pass come from NVIDIA's cumulative energy counter over
+        that pass.
       </li>
     </ul>
 
@@ -92,8 +147,8 @@ export const Methodology = (props: { hardware: Record<string, any>[]; builds: Re
       <li>Only configs with all six benchmarks are ranked. The rest are listed by their quick-tier score.</li>
       <li>
         Each config is evaluated exactly as it serves chat, including thinking where it has it. Thinking tokens come out
-        of the allowance, so reasoning is paid for rather than free. Speed runs don't involve thinking at all: llama-bench
-        times fixed token counts without a chat template.
+        of the allowance, so reasoning is paid for rather than free. Speed runs don't involve thinking: llama-bench times
+        fixed token counts without a chat template, and the chat benchmark turns thinking off.
       </li>
       <li>
         AIME 2025 and GPQA Diamond are graded by the lab: the boxed integer, and the last "Answer: X" line of the answer.
@@ -153,15 +208,18 @@ export const Methodology = (props: { hardware: Record<string, any>[]; builds: Re
 
     <h2>Reproducibility</h2>
     <p>
-      Every run records a hardware snapshot (GPU, driver, CUDA, power limit, CPU, RAM and kernel), the llama.cpp commit, and
-      the exact command. Each run has its own page with everything that was published, including the benchmark settings and a
+      Every run records a hardware snapshot (GPU, driver, CUDA, power limit, CPU, RAM and kernel), the engine build (the
+      llama.cpp commit, or the vLLM version with the serving scripts' commit and patches), and the exact command. Each run has its own page with everything that was published, including the benchmark settings and a
       telemetry summary.
     </p>
 
     <h2>What these numbers don't show</h2>
     <ul>
       <li>They describe this one machine, not every RTX 3090.</li>
-      <li>Speed runs measure one request at a time with synthetic prompts, not multi-user serving throughput.</li>
+      <li>
+        Speed runs measure one request at a time: llama-bench with synthetic prompts, the chat benchmark with eight real
+        ones. Neither is multi-user serving throughput.
+      </li>
       <li>
         The benchmarks are small and use fixed subsets: 30 tasks carry roughly ±9 points of error near 50%, which is what
         the error bars and shared ranks are for.

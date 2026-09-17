@@ -22,7 +22,7 @@ export function bundle(overrides: Overrides = {}) {
   return IngestBody.parse({
     schema_version: 1,
     bundle_sha: overrides.sha ?? 'sha-1',
-    base_model: { slug: 'gemma-3-4b-it', name: 'Gemma 3 4B IT', arch: 'dense', params_b: 3.88 },
+    base_model: GEMMA_BASE,
     model: { slug: 'gemma-3-4b-it-q4_k_m-gguf', name: 'Gemma 3 4B IT Q4_K_M', base: 'gemma-3-4b-it', engine: overrides.engine ?? 'llama.cpp', format: 'gguf', quant: 'Q4_K_M', file_size_bytes: 2483218432 },
     config: { slug: overrides.configSlug ?? 'default', name: overrides.configSlug ?? 'Default', config_hash: overrides.configHash ?? 'hash-a', params: { ctx: overrides.ctx ?? 8192 }, launch_command: 'llama-server -m x.gguf' },
     hardware: { gpu_name: 'RTX 3090', gpu_vram_mb: 24576, driver: '595.99.02', cuda: '13.2', power_limit_w: 280, pcie: 'Gen3 x16', cpu_model: 'Ryzen 5 3600', cpu_threads_visible: 6, ram_mb: 16384, kernel: '7.0', os: 'Debian 13' },
@@ -91,6 +91,108 @@ export function evalsBundle(overrides: EvalOverrides = {}) {
       n_tasks: N_TASKS[task],
       attempts_per_task: task === 'aime_2025' ? 4 : 1,
     })),
+  });
+}
+
+type ChatOverrides = {
+  runId?: string;
+  sha?: string;
+  startedAt?: string;
+  throttled?: boolean;
+  configHash?: string;
+  configSlug?: string;
+  /** Default-sampling and greedy decode t/s. */
+  decode?: number;
+  greedy?: number;
+};
+
+const GEMMA_BASE = { slug: 'gemma-3-4b-it', name: 'Gemma 3 4B IT', arch: 'dense', params_b: 3.88 };
+const QWEN_BASE = { slug: 'qwen3.8-27b', name: 'Qwen3.8 27B', arch: 'dense', params_b: 27 };
+export const VLLM_MODEL = 'qwen3.8-27b-w4a16-autoround-fast';
+export const QWEN_GGUF_MODEL = 'qwen3.8-27b-q4_k_m-gguf';
+
+/** The chat benchmark's metrics, as lab/src/lab/bench/http_chat.py publishes them. */
+function chatMetrics(decode: number, greedy: number, vllm: boolean) {
+  const cohort = (method: string, tps: number) =>
+    [
+      { key: 'decode_tps', value: tps, stddev: +(tps * 0.03).toFixed(2), n: 8, unit: 't/s', samples: Array(8).fill(tps) },
+      { key: 'tpot_ms', value: +(1000 / tps).toFixed(3), unit: 'ms' },
+      { key: 'ttft_ms', value: vllm ? 169 : 212, unit: 'ms' },
+      { key: 'prefill_tps', value: 1450, unit: 't/s' },
+      { key: 'e2e_tps', value: +(tps * 0.97).toFixed(2), unit: 't/s' },
+      { key: 'out_tokens_mean', value: 981, unit: 'tokens' },
+      { key: 'gpu_w_avg', value: 245, unit: 'W' },
+      { key: 'tokens_per_joule', value: +(tps / 245).toFixed(3), unit: 'tok/J' },
+      ...(vllm ? [{ key: 'spec_accept_len', value: 3.21, unit: 'tok/step' }] : []),
+    ].map((m) => ({ ...m, method, n_prompt: 0, n_gen: 1024, depth: 0, concurrency: 1 }));
+  const run = [
+    { key: 'load_s', value: vllm ? 72 : 9, unit: 's' },
+    { key: 'vram_peak_mb', value: vllm ? 23450 : 18740, unit: 'MiB' },
+    { key: 'ram_peak_mb', value: 5120, unit: 'MiB' },
+    { key: 'oom_kills', value: 0, unit: 'count' },
+  ].map((m) => ({ ...m, method: 'http' }));
+  return [...cohort('http-sampled', decode), ...cohort('http-greedy', greedy), ...run];
+}
+
+function chatRun(o: ChatOverrides, id: string, ref: string) {
+  return {
+    id: o.runId ?? id, kind: 'speed', status: 'ok', started_at: o.startedAt ?? '2026-09-17T03:00:00Z', lab_version: '0.1.0',
+    cli_args: `lab bench ${ref} --http`, throttled: o.throttled ?? false, raw: { protocol: 'chat-c1-v1' },
+  };
+}
+
+/** A chat-benchmark run on the gemma llama.cpp config that bundle() speed-tests. */
+export function chatBundle(o: ChatOverrides = {}) {
+  const base = bundle({ configHash: o.configHash, configSlug: o.configSlug });
+  return IngestBody.parse({
+    ...base,
+    schema_version: 2,
+    bundle_sha: o.sha ?? 'chat-gemma-1',
+    run: chatRun(o, '7a7a7a7a-1111-4222-8333-444444444444', `gemma-3-4b-it-q4_k_m-gguf/${base.config.slug}`),
+    metrics: chatMetrics(o.decode ?? 150.5, o.greedy ?? 152.5, false),
+  });
+}
+
+/** Qwen3.8 27B on vLLM: a chat-benchmark run only, since llama-bench is llama.cpp's. */
+export function vllmBundle(o: ChatOverrides = {}) {
+  const slug = o.configSlug ?? '64k-dflash2';
+  return IngestBody.parse({
+    ...bundle(),
+    schema_version: 2,
+    bundle_sha: o.sha ?? 'chat-vllm-1',
+    base_model: QWEN_BASE,
+    model: {
+      slug: VLLM_MODEL, name: 'Qwen3.8 27B W4A16 AutoRound (fast)', base: QWEN_BASE.slug, engine: 'vllm', format: 'safetensors',
+      quant: 'W4A16', file_size_bytes: 19470000000, source_repo: 'dbirks/Qwen3.8-27B-W4A16-AutoRound',
+    },
+    config: {
+      slug, name: slug, config_hash: o.configHash ?? 'hash-vllm', params: { launcher: 'single-user/start_qwen.sh', ctx: 65536, spec: 'dflash2' },
+      launch_command: 'SPEC=dflash2 CTX=fast PREFIX_CACHE=1 single-user/start_qwen.sh',
+    },
+    engine_build: { engine: 'vllm', version: '0.28.0', commit_sha: 'bae2023ff', extra: { dirty: false } },
+    run: {
+      ...chatRun(o, '8b8b8b8b-1111-4222-8333-444444444444', `${VLLM_MODEL}/${slug}`),
+      telemetry: [0, 1, 2].map((t) => ({ t, power_w: 240, vram_mb: 23450, temp_c: 60, util: 99 })),
+    },
+    metrics: chatMetrics(o.decode ?? 124.4, o.greedy ?? 136.8, true),
+  });
+}
+
+/** Qwen3.8 27B Q4_K_M on llama.cpp with a chat-benchmark run: the same base model as vllmBundle(). */
+export function qwenGgufChatBundle(o: ChatOverrides = {}) {
+  const slug = o.configSlug ?? '64k-q8kv';
+  return IngestBody.parse({
+    ...bundle(),
+    schema_version: 2,
+    bundle_sha: o.sha ?? 'chat-qwen-gguf-1',
+    base_model: QWEN_BASE,
+    model: {
+      slug: QWEN_GGUF_MODEL, name: 'Qwen3.8 27B Q4_K_M', base: QWEN_BASE.slug, engine: 'llama.cpp', format: 'gguf', quant: 'Q4_K_M',
+      file_size_bytes: 17400000000,
+    },
+    config: { slug, name: slug, config_hash: o.configHash ?? 'hash-qwen-gguf', params: { ctx: 65536 }, launch_command: 'llama-server -m q.gguf' },
+    run: chatRun(o, '9c9c9c9c-1111-4222-8333-444444444444', `${QWEN_GGUF_MODEL}/${slug}`),
+    metrics: chatMetrics(o.decode ?? 32.7, o.greedy ?? 33.1, false),
   });
 }
 

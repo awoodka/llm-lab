@@ -24,3 +24,20 @@ export function testLabel(m: { key: string; n_prompt: number; n_gen: number }): 
   if (m.key === 'tg_tps') return `tg${m.n_gen}`;
   return m.n_prompt ? `pp${m.n_prompt}` : m.n_gen ? `tg${m.n_gen}` : '';
 }
+
+const ENGINES: Record<string, string> = { 'llama.cpp': 'llama.cpp', exllamav3: 'ExLlamaV3', vllm: 'vLLM' };
+
+export function engineLabel(engine: string): string {
+  return ENGINES[engine] ?? engine;
+}
+
+const METHODS: Record<string, string> = {
+  'http-sampled': 'default sampling',
+  'http-greedy': 'greedy',
+  http: 'chat benchmark',
+  'llama-bench': 'llama-bench',
+};
+
+export function methodLabel(method: string): string {
+  return METHODS[method] ?? method;
+}
