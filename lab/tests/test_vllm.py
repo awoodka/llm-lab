@@ -1,12 +1,15 @@
+import json
 import subprocess
 from pathlib import Path
 
+import httpx
 import pytest
 
 from lab import catalog, paths, publish
 from lab.catalog import ConfigSpec, ModelSpec, Params, Source, VllmParams
-from lab.engines.base import get_engine
-from lab.engines.vllm import CheckoutMismatch, Vllm
+from lab.engines.base import Warmup, get_engine
+from lab.engines.llamacpp import LlamaCppDialect
+from lab.engines.vllm import CheckoutMismatch, Vllm, VllmDialect
 
 SHA = "bae2023ffc98753d337d2d2041784a277599a4c4"
 REF = "qwen3.8-27b-w4a16-autoround-fast/64k-dflash2"
@@ -173,3 +176,99 @@ def test_engines_carry_boot_timeouts_and_cache_busting_extras():
     assert llama.boot_timeout_s < vllm.boot_timeout_s == 1500
     assert llama.request_extras() == {"cache_prompt": False}
     assert vllm.request_extras()["cache_salt"] != vllm.request_extras()["cache_salt"]
+
+
+# -- the eval dialect --------------------------------------------------------------
+def _dialect(tmp_path: Path, **params) -> VllmDialect:
+    return VllmDialect(served_model=REF, weights_dir=tmp_path, params=_cfg(SHA, **params).params)
+
+
+def test_the_prompt_is_counted_in_one_call_that_carries_tools_and_template_kwargs(tmp_path):
+    """vLLM renders and counts in the same call, so what is counted is what the completion will see."""
+    seen = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(json.loads(request.content))
+        return httpx.Response(200, json={"count": 304, "max_model_len": 65536, "tokens": [1, 2]})
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        n = _dialect(tmp_path).count_prompt(client, "http://x", {
+            "model": "ignored", "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{"type": "function", "function": {"name": "f"}}],
+            "chat_template_kwargs": {"enable_thinking": False}, "max_tokens": 99,
+        })
+    assert n == 304
+    sent = seen[0]
+    assert sent["model"] == REF and sent["add_generation_prompt"] is True
+    assert sent["tools"] and sent["chat_template_kwargs"] == {"enable_thinking": False}
+    assert "add_special_tokens" not in sent, "the chat path's default is what both sides must agree on"
+    assert "max_tokens" not in sent
+
+
+def test_each_task_attempt_gets_its_own_cache_scope(tmp_path):
+    """vLLM's prefix cache is global: without a per-task salt one task is charged for another's prefill."""
+    d = _dialect(tmp_path)
+    assert d.cache_scope("aime#0") == d.cache_scope("aime#0")
+    assert d.cache_scope("aime#0") != d.cache_scope("gpqa#0"), "two tasks must not share a prefix"
+    assert d.cache_scope("aime#0") != d.cache_scope("aime#1"), "a retry starts as cold as its budget claims"
+    assert set(d.cache_scope("aime#0")) == {"cache_salt"}
+
+
+def test_props_report_the_sampling_without_ever_naming_a_local_path(tmp_path):
+    """/v1/models answers with the weights' path on disk, and a published run names files, never paths."""
+    (tmp_path / "generation_config.json").write_text(json.dumps({"temperature": 1.0, "top_k": 20, "top_p": 0.95, "bos_token_id": 1}))
+    card = {"id": REF, "max_model_len": 65536, "root": "/home/alex/qwen-serving/models/Qwen3.8-27B-W4A16-AutoRound-fast"}
+
+    with httpx.Client(transport=httpx.MockTransport(lambda r: httpx.Response(200, json={"data": [card]}))) as client:
+        props = _dialect(tmp_path).props(client, "http://x", Warmup(seconds=1.0, replies=2, tool_calls=True))
+
+    assert props["sampling"] == {"temperature": 1.0, "top_k": 20, "top_p": 0.95}, "only what steers generation"
+    assert props["n_ctx"] == 65536 and props["served_model"] == REF
+    assert props["chat_template_caps"] == {"supports_tools": True, "supports_tool_calls": True}
+    publish.check_no_local_paths({"run": {"raw": {"props": props}}})
+
+
+def test_a_server_that_cannot_call_tools_is_reported_as_such(tmp_path):
+    """A wrong tool-call parser answers with prose, which a tool benchmark would score as a bad model."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"choices": [{"message": {"content": "I would call get_weather"}, "finish_reason": "stop"}]})
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        warm = _dialect(tmp_path).warmup(client, "http://x", REF, tools=True)
+    assert warm.tool_calls is False and warm.replies == 2
+
+    def calls(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"choices": [{"message": {"tool_calls": [{"id": "1"}]}, "finish_reason": "tool_calls"}]})
+
+    with httpx.Client(transport=httpx.MockTransport(calls)) as client:
+        assert _dialect(tmp_path).warmup(client, "http://x", REF, tools=True).tool_calls is True
+        assert _dialect(tmp_path).warmup(client, "http://x", REF, tools=False).tool_calls is None
+
+
+@pytest.mark.parametrize(("engine_name", "parallel", "expected"), [
+    ("llama.cpp", 1, {}),
+    ("llama.cpp", 4, {"parallel": 4, "ctx": 4 * 32768}),
+    ("vllm", 1, {}),
+    ("vllm", 4, {"parallel": 4}),
+])  # fmt: skip
+def test_serving_several_requests_at_once_relaunches_only_the_engine_that_needs_it(engine_name, parallel, expected, tmp_path):
+    """llama.cpp splits one KV cache into slots; vLLM already has them, so a parallel eval is the same server."""
+    if engine_name == "llama.cpp":
+        cfg = ConfigSpec(slug="c", name="C", params=Params(ctx=32768))
+        dialect = LlamaCppDialect(served_model="m")
+    else:
+        cfg = _cfg(SHA, ctx=32768, max_seqs=8)
+        dialect = _dialect(tmp_path, ctx=32768, max_seqs=8)
+
+    launch, overrides = dialect.eval_launch(cfg, parallel)
+    assert overrides == expected
+    assert cfg.params.ctx == 32768, "the catalog's config is never mutated"
+    if engine_name == "vllm":
+        assert launch is cfg, "nothing to relaunch: the eval runs on the config that serves chat"
+    elif parallel > 1:
+        assert launch.params.parallel == parallel and launch.params.ctx == 32768 * parallel
+
+
+def test_more_requests_than_the_config_serves_is_refused(tmp_path):
+    with pytest.raises(ValueError, match="max_seqs"):
+        _dialect(tmp_path, max_seqs=8).eval_launch(_cfg(SHA, max_seqs=8), 16)

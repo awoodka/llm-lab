@@ -316,7 +316,7 @@ def eval_cmd(
     benchmarks: str | None = typer.Option(None, help="Comma-separated subset of the tier, e.g. aime_2025,gpqa_diamond"),
     limit: int | None = typer.Option(None, help="First N tasks of each benchmark: a smoke test, never publishable"),
     attempts: int | None = typer.Option(None, help="Override attempts per task (AIME uses 4)"),
-    parallel: int = typer.Option(1, help="Requests in flight; the server is relaunched with -np N and N× the context"),
+    parallel: int = typer.Option(1, help="Requests in flight, up to what the config already serves"),
     resume: str | None = typer.Option(None, help="Continue a run: its id or directory name"),
     stop_at: str | None = typer.Option(None, "--stop-at", help="End the sitting cleanly at HH:MM local time"),
     wait: bool = typer.Option(False, help="Queue behind a held GPU lock instead of failing"),
@@ -330,6 +330,15 @@ def eval_cmd(
     if tier not in ("quick", "deep"):
         _fail(f"--tier is quick or deep, not {tier!r}")
     _check_power()
+    # A tier runs for hours, usually over ssh. A dropped connection or a `systemctl stop` should end the
+    # sitting the way Ctrl-C does — checkpoint saved, resumable, chat handed back — not kill it outright.
+    import signal
+
+    def _interrupt(signum, frame):
+        raise KeyboardInterrupt
+
+    for sig in (signal.SIGTERM, signal.SIGHUP):
+        signal.signal(sig, _interrupt)
     rd = run_evals(
         ref,
         tier=tier,
@@ -521,3 +530,12 @@ def hosted_start() -> None:
 @hosted_app.command("stop")
 def hosted_stop() -> None:
     hosted.stop_hosted()
+
+
+@hosted_app.command("recover")
+def hosted_recover() -> None:
+    """Restart the hosted model if the GPU job that paused it died without putting it back.
+
+    A timer runs this, so a crashed benchmark never leaves chat down until someone notices.
+    """
+    typer.echo("restarted the hosted model" if hosted.recover_paused_hosted() else "nothing to recover")

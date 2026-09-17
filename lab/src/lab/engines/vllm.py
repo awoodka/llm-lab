@@ -13,13 +13,16 @@ import json
 import re
 import shlex
 import subprocess
+import time
 import uuid
 from pathlib import Path
+from typing import Any
 
 import httpx
 
 from lab import catalog, paths
 from lab.catalog import ConfigSpec, ModelSpec, VllmParams
+from lab.engines.base import SHARED_SAMPLING_FIELDS, Warmup
 from lab.schema import EngineBuild
 
 #: Native in vLLM 0.28.0; the launcher repo keeps it in the series for older installs.
@@ -38,6 +41,136 @@ class CheckoutMismatch(RuntimeError):
 
 def _flag(on: bool) -> str:
     return "1" if on else "0"
+
+
+#: vLLM's own request vocabulary that steers generation, on top of the shared set.
+VLLM_SAMPLING_FIELDS = frozenset({
+    "repetition_penalty", "length_penalty", "use_beam_search", "best_of", "n",
+    "prompt_logprobs", "logprob_token_ids", "allowed_token_ids", "bad_words", "stop_token_ids",
+    "include_stop_str_in_output", "ignore_eos", "skip_special_tokens", "spaces_between_special_tokens",
+    "truncate_prompt_tokens", "truncation_side", "thinking_token_budget", "reasoning_effort",
+    "repetition_detection", "priority", "vllm_xargs", "echo", "cache_salt",
+})
+#: What a run records of how the server sampled. vLLM has no /props, so this comes from the model's own config.
+GENERATION_KEYS = ("temperature", "top_p", "top_k", "min_p", "repetition_penalty")
+#: Fields that change the prompt the chat template renders, so the count must carry them too.
+TOKENIZE_FIELDS = ("tools", "chat_template_kwargs", "continue_final_message", "documents")
+
+
+class VllmDialect:
+    """vLLM: one tokenize call renders and counts, and the prompt cache is shared by every request."""
+
+    sampling_fields = SHARED_SAMPLING_FIELDS | VLLM_SAMPLING_FIELDS
+
+    def __init__(self, served_model: str, weights_dir: Path, params: VllmParams, build: EngineBuild | None = None):
+        self.served_model = served_model
+        self.weights_dir = weights_dir
+        self.params = params
+        self.build = build
+
+    def count_prompt(self, client: httpx.Client, upstream: str, body: dict[str, Any]) -> int:
+        """Ask the server to render and count in one call.
+
+        `/tokenize` applies the same chat template the completion will, so tools and thinking-mode kwargs
+        are counted. `add_special_tokens` is left at the chat path's own default (false: the template
+        carries any BOS), so both paths agree. Verified against vLLM 0.28.0 on Qwen3.8 W4A16, with and
+        without tools: computed count == reported `usage.prompt_tokens`.
+        """
+        payload: dict[str, Any] = {
+            "model": self.served_model,
+            "messages": body["messages"],
+            "add_generation_prompt": body.get("add_generation_prompt", True),
+        }
+        payload.update({k: body[k] for k in TOKENIZE_FIELDS if body.get(k) is not None})
+        r = client.post(f"{upstream}/tokenize", json=payload)
+        r.raise_for_status()
+        return int(r.json()["count"])
+
+    def cache_scope(self, scope: str) -> dict[str, Any]:
+        """One salt per task attempt: vLLM's prefix cache is global, so without this a task could be
+        charged for a prefill another task already paid for, and a retry would inherit its own first try."""
+        return {"cache_salt": hashlib.sha256(scope.encode()).hexdigest()[:32]}
+
+    def _chat(self, client: httpx.Client, upstream: str, body: dict[str, Any]) -> dict[str, Any]:
+        r = client.post(f"{upstream}/v1/chat/completions", json={"model": self.served_model, **body,
+                                                                 "cache_salt": uuid.uuid4().hex})
+        r.raise_for_status()
+        return r.json()
+
+    def warmup(self, client: httpx.Client, upstream: str, model_id: str, *, tools: bool) -> Warmup:
+        """Pay the first request's one-off costs, and check that a tool call comes back as a tool call.
+
+        The wrong --tool-call-parser does not fail: the call arrives as ordinary text, which a tool
+        benchmark scores as a model that cannot use tools. Better to find out here than after a tier.
+        """
+        started = time.monotonic()
+        replies = 0
+        self._chat(client, upstream, {"messages": [{"role": "user", "content": "Say ok."}], "max_tokens": 32})
+        replies += 1
+        tool_calls = None
+        if tools:
+            data = self._chat(client, upstream, {
+                "messages": [{"role": "user", "content": "What is the weather in Paris? Use the tool."}],
+                "tools": [{"type": "function", "function": {
+                    "name": "get_weather", "description": "Current weather for a city",
+                    "parameters": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]},
+                }}],
+                "tool_choice": "auto", "max_tokens": 256,
+            })
+            choice = (data.get("choices") or [{}])[0]
+            tool_calls = bool((choice.get("message") or {}).get("tool_calls")) or choice.get("finish_reason") == "tool_calls"
+            replies += 1
+        return Warmup(seconds=round(time.monotonic() - started, 2), replies=replies, tool_calls=tool_calls)
+
+    def _generation_config(self) -> dict[str, Any]:
+        """What vLLM will actually sample with: the model's generation config, then the launch's overrides."""
+        try:
+            gen = json.loads((self.weights_dir / "generation_config.json").read_text())
+        except (OSError, json.JSONDecodeError):
+            gen = {}
+        args = self.params.extra_args
+        if "--override-generation-config" in args:
+            try:
+                gen.update(json.loads(args[args.index("--override-generation-config") + 1]))
+            except (IndexError, json.JSONDecodeError):
+                pass
+        return {k: gen[k] for k in GENERATION_KEYS if k in gen}
+
+    def props(self, client: httpx.Client, upstream: str, warmup: Warmup | None = None) -> dict[str, Any]:
+        """The /props llama-server would have given, assembled from what vLLM does expose.
+
+        Only the served id and context length are taken from the model card: its `root` is a local path,
+        and a run publishes file names, never paths.
+        """
+        try:
+            card = client.get(f"{upstream}/v1/models", timeout=30).raise_for_status().json()["data"][0]
+        except (httpx.HTTPError, IndexError, KeyError) as e:
+            return {"error": str(e)}
+        tools = bool(self.params.tools)
+        return {
+            "sampling": self._generation_config(),
+            "sampling_source": "generation_config.json plus the launch's overrides (vLLM has no /props)",
+            "n_ctx": card.get("max_model_len"),
+            "served_model": card.get("id"),
+            "total_slots": self.params.max_seqs,
+            "build_info": f"vllm {self.build.version}" + (f" ({self.build.commit_sha})" if self.build and self.build.commit_sha else "")
+            if self.build else None,
+            "chat_template_caps": {
+                "supports_tools": tools,
+                "supports_tool_calls": bool(warmup.tool_calls) if warmup and warmup.tool_calls is not None else tools,
+            },
+        }
+
+    def eval_launch(self, cfg: ConfigSpec, parallel: int) -> tuple[ConfigSpec, dict[str, Any]]:
+        """Nothing to relaunch: the context is per request and the slots are already there.
+
+        That is the point — a parallel eval measures exactly the config that serves chat.
+        """
+        seats = cfg.params.max_seqs
+        if parallel > seats:
+            raise ValueError(f"--parallel {parallel} wants more than this config's {seats} slots (max_seqs); "
+                             "serving more would be a different config from the one that serves chat")
+        return cfg, {"parallel": parallel} if parallel > 1 else {}
 
 
 class Vllm:
@@ -119,6 +252,19 @@ class Vllm:
 
     def request_extras(self) -> dict:
         return {"cache_salt": uuid.uuid4().hex}
+
+    server_log_name = "vllm-server.log"
+
+    def dialect(self, model: ModelSpec, cfg: ConfigSpec) -> VllmDialect:
+        p = cfg.params
+        assert isinstance(p, VllmParams)
+        build = None
+        try:
+            build = self.build_info()
+        except Exception:  # noqa: BLE001 - provenance only; a run must not fail because git is unhappy
+            pass
+        return VllmDialect(served_model=f"{model.slug}/{cfg.slug}",
+                           weights_dir=catalog.resolve_model_path(model), params=p, build=build)
 
     @staticmethod
     def served_model(base_url: str) -> dict:

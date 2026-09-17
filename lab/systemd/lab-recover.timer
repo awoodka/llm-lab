@@ -1,0 +1,10 @@
+[Unit]
+Description=lab: check every two minutes that chat did not stay paused
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=2min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

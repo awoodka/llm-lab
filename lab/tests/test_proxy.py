@@ -11,6 +11,13 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import httpx
 import pytest
 
+from lab.catalog import VllmParams
+from lab.engines.llamacpp import LlamaCppDialect
+from lab.engines.vllm import VllmDialect
+
+
+def _vllm_params() -> VllmParams:
+    return VllmParams(launcher="single-user/start_qwen.sh", launcher_commit="a" * 40)
 from lab.evals.allowance import Allowance, SpeedPoint
 from lab.evals.drivers.base import Task
 from lab.evals.proxy import AllowanceProxy
@@ -21,17 +28,24 @@ QWEN = Allowance(ctx=65536, pp0=949, tg=[SpeedPoint(0, 31.8), SpeedPoint(4096, 3
 
 
 class FakeServer:
-    """A llama-server stand-in: one token per word, and an answer that stops on the size it was given.
+    """A model server stand-in: one token per word, and an answer that stops on the size it was given.
+
+    `engine` picks which server it imitates. llama.cpp renders a template on one route and tokenizes on
+    another, reports `timings`, and always claims a cached prefix. vLLM does both in one route, has no
+    `/apply-template` or `/props`, answers `/health` with an empty body, and reports cached tokens only
+    for a `cache_salt` it has already seen — so a proxy that reuses a salt across tasks is caught here.
 
     With `bos`, it behaves like Gemma 3: the rendered template has no BOS and tokenizing with special
     tokens adds one, as the server does to every chat prompt. `misreport` skews the count it reports.
     """
 
-    def __init__(self):
+    def __init__(self, engine: str = "llama.cpp"):
         self.seen: list[dict] = []
         self.fail_with: int | None = None
         self.bos = False
         self.misreport = 0
+        self.engine = engine
+        self.salts_seen: set[str] = set()
         proxy_self = self
 
         def render(body) -> str:
@@ -58,13 +72,28 @@ class FakeServer:
                 self.wfile.write(body)
 
             def do_GET(self):  # noqa: N802
+                if proxy_self.engine == "vllm":
+                    if self.path == "/health":
+                        self.send_response(200)
+                        self.send_header("content-length", "0")
+                        self.end_headers()
+                        return
+                    if self.path != "/v1/models":
+                        return self._json(404, {"object": "error", "message": "Not Found"})
+                    return self._json(200, {"data": [{"id": "m", "max_model_len": 65536, "root": "/home/alex/w"}]})
                 self._json(200, {"status": "ok"} if self.path == "/health" else {"data": []})
 
             def do_POST(self):  # noqa: N802
                 body = json.loads(self.rfile.read(int(self.headers["content-length"])) or b"{}")
                 if self.path == "/apply-template":
+                    if proxy_self.engine == "vllm":
+                        return self._json(404, {"object": "error", "message": "Not Found"})
                     return self._json(200, {"prompt": render(body)})
                 if self.path == "/tokenize":
+                    if proxy_self.engine == "vllm":
+                        # One call: the template is applied here, so tools and kwargs are already counted.
+                        n = len(tokens(render(body), body.get("add_special_tokens", False)))
+                        return self._json(200, {"count": n, "max_model_len": 65536, "tokens": list(range(n))})
                     return self._json(200, {"tokens": tokens(body["content"], body.get("add_special", False))})
                 proxy_self.seen.append(body)
                 prompt = len(tokens(render(body), True)) + proxy_self.misreport
@@ -77,12 +106,19 @@ class FakeServer:
                     return self._stream(prompt, completion, finish)
                 # Thinking arrives apart from the answer, as llama-server sends it with a reasoning format.
                 message = {"role": "assistant", "reasoning_content": "maybe \\boxed{70}", "content": "\\boxed{12}"}
-                return self._json(200, {
+                answer = {
                     "id": "chatcmpl-1", "model": "fake",
                     "choices": [{"index": 0, "message": message, "finish_reason": finish}],
                     "usage": {"prompt_tokens": prompt, "completion_tokens": completion, "prompt_tokens_details": {"cached_tokens": 3}},
                     "timings": {"predicted_per_second": 30.5, "prompt_per_second": 900.0},
-                })
+                }
+                if proxy_self.engine == "vllm":
+                    salt = body.get("cache_salt")
+                    cached = 3 if salt in proxy_self.salts_seen else 0
+                    proxy_self.salts_seen.add(salt)
+                    answer.pop("timings")
+                    answer["usage"]["prompt_tokens_details"] = {"cached_tokens": cached}
+                return self._json(200, answer)
 
             def _stream(self, prompt, completion, finish):
                 self.send_response(200)
@@ -110,16 +146,24 @@ class FakeServer:
         self.http.server_close()
 
 
-@pytest.fixture
-def upstream():
-    server = FakeServer()
+@pytest.fixture(params=["llama.cpp", "vllm"])
+def upstream(request):
+    """Every proxy test runs against both servers: the rules are the proxy's, not one engine's."""
+    server = FakeServer(engine=request.param)
     yield server
     server.close()
 
 
 @pytest.fixture
-def proxy(upstream, tmp_path):
-    p = AllowanceProxy(upstream.url, QWEN, log_path=tmp_path / "requests.jsonl")
+def dialect(upstream, tmp_path):
+    if upstream.engine == "llama.cpp":
+        return LlamaCppDialect(served_model="m")
+    return VllmDialect(served_model="m", weights_dir=tmp_path, params=_vllm_params())
+
+
+@pytest.fixture
+def proxy(upstream, dialect, tmp_path):
+    p = AllowanceProxy(upstream.url, QWEN, dialect=dialect, log_path=tmp_path / "requests.jsonl")
     with p:
         yield p
 
@@ -148,7 +192,7 @@ def test_a_prompt_that_uses_up_the_limit_is_answered_as_unfinished_without_askin
     assert proxy.stats.totals().length_stops == 1
 
 
-def test_per_task_numbers_and_the_request_log_are_what_the_run_publishes(proxy, tmp_path):
+def test_per_task_numbers_and_the_request_log_are_what_the_run_publishes(proxy, upstream, tmp_path):
     chat(proxy, words=100, task="gpqa:1")
     chat(proxy, words=100, task="gpqa:2")
     with proxy.task("gpqa:3"):
@@ -164,22 +208,26 @@ def test_per_task_numbers_and_the_request_log_are_what_the_run_publishes(proxy, 
     assert [x["task"] for x in lines] == ["gpqa:1", "gpqa:2", "gpqa:3"]
     assert lines[0]["prompt_tokens"] == 100
     assert lines[0]["finish_reason"] == "stop"
-    assert lines[0]["cached_tokens"] == 3
-    assert lines[0]["predicted_per_second"] == 30.5
+    if upstream.engine == "llama.cpp":
+        assert lines[0]["cached_tokens"] == 3
+        assert lines[0]["predicted_per_second"] == 30.5
+    else:
+        assert lines[0]["cached_tokens"] == 0, "a first request of a task has nothing cached to inherit"
+        assert lines[0]["predicted_per_second"] is None, "vLLM reports no per-request timings"
 
 
-def test_an_answer_that_runs_out_of_allowance_is_counted_as_a_length_stop(upstream, tmp_path):
+def test_an_answer_that_runs_out_of_allowance_is_counted_as_a_length_stop(upstream, dialect, tmp_path):
     # 65k of context left, but only ~60 tokens of thinking time: the model gets cut off.
     tight = Allowance(ctx=65536, pp0=949, tg=[SpeedPoint(0, 31.8)], limit_s=2.0)
-    with AllowanceProxy(upstream.url, tight, log_path=tmp_path / "r.jsonl") as proxy:
+    with AllowanceProxy(upstream.url, tight, dialect=dialect, log_path=tmp_path / "r.jsonl") as proxy:
         r = chat(proxy, words=100, task="aime:1")
         assert r.json()["choices"][0]["finish_reason"] == "length"
         assert upstream.seen[-1]["max_tokens"] == 60
         assert proxy.stats.for_task("aime:1").length_stops == 1
 
 
-def test_the_deep_tier_is_capped_by_context_only(upstream, tmp_path):
-    with AllowanceProxy(upstream.url, Allowance(ctx=65536, limit_s=None), log_path=tmp_path / "r.jsonl") as proxy:
+def test_the_deep_tier_is_capped_by_context_only(upstream, dialect, tmp_path):
+    with AllowanceProxy(upstream.url, Allowance(ctx=65536, limit_s=None), dialect=dialect, log_path=tmp_path / "r.jsonl") as proxy:
         chat(proxy, words=1000)
         assert upstream.seen[-1]["max_tokens"] == 64536
 
@@ -213,13 +261,18 @@ def test_an_upstream_failure_is_reported_and_recorded(proxy, upstream):
     assert proxy.stats.for_task("bfcl:9").errors == 1
 
 
-def test_health_and_models_pass_through(proxy):
-    assert httpx.get(f"http://127.0.0.1:{proxy.port}/health", timeout=10).json() == {"status": "ok"}
-    assert httpx.get(f"{proxy.base_url}/models", timeout=10).status_code == 200
+def test_health_and_models_pass_through(proxy, upstream):
+    """Relayed verbatim, including an engine's own 404s: the proxy speaks for the server, not over it."""
+    assert httpx.get(f"http://127.0.0.1:{proxy.port}/health", timeout=10).status_code == 200
+    if upstream.engine == "llama.cpp":
+        assert httpx.get(f"http://127.0.0.1:{proxy.port}/health", timeout=10).json() == {"status": "ok"}
+        assert httpx.get(f"{proxy.base_url}/models", timeout=10).status_code == 200
     assert httpx.post(f"{proxy.base_url}/embeddings", json={}, timeout=10).status_code == 404
 
 
 def test_a_bos_the_template_leaves_out_is_counted_the_way_the_server_counts_it(proxy, upstream):
+    if upstream.engine != "llama.cpp":
+        pytest.skip("only llama.cpp renders and tokenizes separately, so only it can disagree with itself")
     upstream.bos = True
     r = chat(proxy, words=8000)
     assert r.headers["x-lab-prompt-tokens"] == "8001", "Gemma's BOS is part of the prompt the model sees"
@@ -260,11 +313,18 @@ def test_requests_of_one_task_share_its_time_limit(proxy, upstream, tmp_path):
     assert [x["cached_estimate"] for x in lines] == [0, 8000, 8100], "the previous prompt is still in the slot"
     stats = proxy.stats.for_task("bfcl:multi_turn_base_0#1")
     assert stats.budget_s == pytest.approx(sum(x["cost_s"] for x in lines), abs=0.01)
-    # The charge uses the server's own cached count (3), so each prompt is almost fully paid for.
-    assert lines[0]["cost_s"] == pytest.approx(QWEN.cost_s(8000, 3, 12), abs=0.001)
+    # The charge uses the server's own cached count, so each prompt is paid for as the server served it.
+    # llama.cpp holds the previous turn in its slot; vLLM has nothing to reuse until this task's salt
+    # has been seen once, which is the point of scoping the cache per task.
+    first_cached = 3 if upstream.engine == "llama.cpp" else 0
+    assert lines[0]["cost_s"] == pytest.approx(QWEN.cost_s(8000, first_cached, 12), abs=0.001)
+    assert [x["cached_tokens"] for x in lines] == [first_cached, 3, 3]
 
     other = chat(proxy, words=8000, task="bfcl:multi_turn_base_1#1")
     assert other.headers["x-lab-allowance"] == "8759", "another task starts with its own full limit"
+    if upstream.engine == "vllm":
+        salts = {b["cache_salt"] for b in upstream.seen}
+        assert len(salts) == 2, "one salt for the three turns of a task, a different one for the next task"
 
 
 class FakeBox:
@@ -312,9 +372,9 @@ def test_a_boxed_task_is_graded_by_its_harness_and_costed_by_the_proxy(proxy, up
     assert len(reply["transcript"]) == 2
 
 
-def test_a_boxed_task_that_ran_out_of_time_is_wrong_whatever_the_harness_said(upstream, tmp_path):
+def test_a_boxed_task_that_ran_out_of_time_is_wrong_whatever_the_harness_said(upstream, dialect, tmp_path):
     tight = Allowance(ctx=65536, pp0=949, tg=[SpeedPoint(0, 31.8)], limit_s=2.0)
-    with AllowanceProxy(upstream.url, tight, log_path=tmp_path / "r.jsonl") as proxy:
+    with AllowanceProxy(upstream.url, tight, dialect=dialect, log_path=tmp_path / "r.jsonl") as proxy:
         record, _ = boxed_session(proxy, FakeBox(turns=2, passed=True)).answer(BY_KEY["bfcl"], Task(id="t", messages=[], answer=""), 1)
     assert record.finish_reason == "length" and not record.passed
 
@@ -329,3 +389,35 @@ def test_a_broken_harness_is_retried_with_a_fresh_limit_then_excluded(proxy, ups
     box = FakeBox(fail_times=99)
     record, _ = boxed_session(proxy, box).answer(BY_KEY["bfcl"], Task(id="u", messages=[], answer=""), 1)
     assert record.excluded and "harness failure" in record.error and box.restarts == 3
+
+
+def test_a_harness_can_never_choose_how_the_model_samples(proxy, upstream):
+    """Whatever the harness asks for, the config's launch flags decide. Each engine has its own vocabulary."""
+    chat(proxy, words=100, temperature=0.001, top_p=0.5, seed=7, response_format={"type": "json_object"},
+         repetition_penalty=1.2, ignore_eos=True, min_tokens=500, repeat_penalty=1.3, mirostat=2,
+         tools=[{"type": "function", "function": {"name": "f"}}], tool_choice="auto",
+         chat_template_kwargs={"enable_thinking": False})
+    sent = upstream.seen[-1]
+    # Shared across engines: plain sampling, and constrained decoding, which would put one row's numbers
+    # on a different footing from every other row's.
+    for field in ("temperature", "top_p", "seed", "response_format", "min_tokens"):
+        assert field not in sent, f"{field} reached the model"
+    # Then each engine's own vocabulary. A name the server has never heard of is inert anyway.
+    own = ("repeat_penalty", "mirostat") if upstream.engine == "llama.cpp" else ("repetition_penalty", "ignore_eos")
+    for field in own:
+        assert field not in sent, f"{field} reached the model"
+    assert sent["tools"] and sent["tool_choice"] == "auto", "what the task is allowed to do still gets through"
+    assert sent["chat_template_kwargs"] == {"enable_thinking": False}
+    assert sent["max_tokens"] > 0, "the proxy sets the size itself"
+
+
+def test_a_retry_after_an_infrastructure_failure_is_as_cold_as_its_budget(proxy, upstream):
+    """reset_task hands back the full limit, so the attempt must not inherit the cache it already warmed."""
+    chat(proxy, words=100, task="bfcl:1")
+    before = proxy.scope("bfcl:1")
+    proxy.reset_task("bfcl:1")
+    assert proxy.scope("bfcl:1") != before
+    chat(proxy, words=100, task="bfcl:1")
+    if upstream.engine == "vllm":
+        assert upstream.seen[-1]["cache_salt"] != upstream.seen[0]["cache_salt"]
+    assert proxy.stats.for_task("bfcl:1").requests == 1, "the retry starts the task's accounting over"

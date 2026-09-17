@@ -1,21 +1,22 @@
 """One place where the thinking allowance is enforced: an OpenAI-compatible proxy in front of the
 config's own server.
 
-Harnesses talk to the proxy, never to llama-server, so every benchmark is sized the same way and every
-request lands in one log. Two rules the proxy keeps:
+Harnesses talk to the proxy, never to the model's server, so every benchmark is sized the same way and
+every request lands in one log. Three rules the proxy keeps:
 
 - **It never changes how the model samples.** Sampling fields are stripped from each request, so what
   runs is what the config was launched with (`/props` records it in the run).
+- **It keeps one task's prompt cache to itself.** Engines whose cache is shared across requests are
+  given a per-task scope, so no task is charged a discount it did not earn (and a retry starts cold).
 - **It sizes every answer.** `max_tokens` becomes the allowance for that prompt; thinking counts toward
   it, and a request that ends on `length` is an unfinished answer, which the benchmark scores as wrong.
   Requests tagged with the same task share its time limit: each answered request is charged its
   uncached prompt and its generated tokens at the measured speeds, and the next one gets what is left.
 
-Prompt tokens are counted the way the server itself counts them: render the chat template, then
-tokenize it with special tokens added. `/apply-template` leaves out the BOS a model like Gemma 3 needs
-and the server adds it back when it tokenizes, so the count must too. Verified against llama-server
-b10883 on Qwen3.8 (no BOS) and Gemma 3 (BOS): computed count == reported `usage.prompt_tokens`. Every
-answer is checked against that report, and a disagreement is logged and counted rather than trusted.
+Prompt tokens are counted the way the server itself counts them, which is the one thing that differs
+per engine: the config's `ServerDialect` does the counting, and which sampling fields to strip comes
+from it too. Every answer is checked against the server's own `usage.prompt_tokens`, and a
+disagreement is logged and counted rather than trusted — that check is what keeps a dialect honest.
 
 Each answer carries `x-lab-prompt-tokens` and `x-lab-allowance` headers, so a harness records the size
 that was actually enforced.
@@ -33,20 +34,11 @@ from typing import Any
 
 import httpx
 
+from lab.engines.base import ServerDialect
 from lab.evals.allowance import Allowance
 
-#: Dropped from every request: the config's launch flags decide how it samples, not the harness.
-SAMPLING_FIELDS = frozenset({
-    "temperature", "top_p", "top_k", "min_p", "typical_p", "typ_p", "tfs_z", "top_n_sigma",
-    "repeat_penalty", "repeat_last_n", "penalize_nl", "presence_penalty", "frequency_penalty",
-    "dry_multiplier", "dry_base", "dry_allowed_length", "dry_penalty_last_n", "dry_sequence_breakers",
-    "xtc_probability", "xtc_threshold", "mirostat", "mirostat_tau", "mirostat_eta",
-    "samplers", "seed", "min_keep", "logit_bias", "n_probs", "logprobs", "top_logprobs",
-})
 #: Dropped because the proxy sets the answer's size itself.
-LENGTH_FIELDS = frozenset({"max_tokens", "max_completion_tokens", "n_predict"})
-#: Passed to the template renderer so the count matches what the server will build.
-TEMPLATE_FIELDS = ("messages", "tools", "tool_choice", "chat_template_kwargs", "add_generation_prompt")
+LENGTH_FIELDS = frozenset({"max_tokens", "max_completion_tokens", "n_predict", "min_tokens"})
 
 
 @dataclass
@@ -100,9 +92,13 @@ class AllowanceProxy:
     Start it inside the session that owns the GPU; `base_url` is what harnesses are pointed at.
     """
 
-    def __init__(self, upstream: str, allowance: Allowance, *, log_path: Path | None = None, host: str = "127.0.0.1", port: int = 0):
+    def __init__(self, upstream: str, allowance: Allowance, *, dialect: ServerDialect,
+                 log_path: Path | None = None, host: str = "127.0.0.1", port: int = 0):
         self.upstream = upstream.rstrip("/")
         self.allowance = allowance
+        self.dialect = dialect
+        #: Bumped when a task is retried, so its second attempt shares no cache with its first.
+        self._epochs: dict[str, int] = {}
         self.stats = ProxyStats()
         self.current_task = "unknown"
         #: Answers whose server-reported prompt size differed from the proxy's count.
@@ -155,23 +151,18 @@ class AllowanceProxy:
 
     # -- request handling ------------------------------------------------------
     def prompt_tokens(self, body: dict[str, Any]) -> int:
-        """Count the prompt the way the server will build it: render the template, then tokenize."""
-        rendered = self._client.post(
-            f"{self.upstream}/apply-template",
-            json={k: body[k] for k in TEMPLATE_FIELDS if k in body},
-        )
-        rendered.raise_for_status()
-        tokens = self._client.post(
-            f"{self.upstream}/tokenize",
-            json={"content": rendered.json()["prompt"], "add_special": True},
-        )
-        tokens.raise_for_status()
-        return len(tokens.json()["tokens"])
+        """Count the prompt the way this engine's server will build it."""
+        return self.dialect.count_prompt(self._client, self.upstream, body)
 
     def reset_task(self, task: str) -> None:
         """Forget a task's spending, so a retry after an infrastructure failure starts with its full limit."""
         with self._lock:
             self.stats.tasks.pop(task, None)
+            self._epochs[task] = self._epochs.get(task, 0) + 1
+
+    def scope(self, task: str) -> str:
+        """The cache scope of this task's current attempt."""
+        return f"{task}#{self._epochs.get(task, 0)}"
 
     def size(self, task: str, prompt_tokens: int) -> tuple[int, int]:
         """The allowance for this request of `task`, and how much of its prompt is assumed cached.
@@ -184,10 +175,11 @@ class AllowanceProxy:
             cached = min(stats.last_prompt_tokens, prompt_tokens) if stats.requests else 0
             return self.allowance.for_prompt(prompt_tokens, spent_s=stats.budget_s, cached_tokens=cached), cached
 
-    @staticmethod
-    def sized_body(body: dict[str, Any], allowance: int) -> dict[str, Any]:
-        out = {k: v for k, v in body.items() if k not in SAMPLING_FIELDS and k not in LENGTH_FIELDS}
+    def sized_body(self, body: dict[str, Any], allowance: int, scope: str) -> dict[str, Any]:
+        dropped = self.dialect.sampling_fields | LENGTH_FIELDS | self.dialect.cache_scope(scope).keys()
+        out = {k: v for k, v in body.items() if k not in dropped}
         out["max_tokens"] = allowance
+        out.update(self.dialect.cache_scope(scope))
         if out.get("stream"):
             out["stream_options"] = {**(out.get("stream_options") or {}), "include_usage": True}
         return out
@@ -315,7 +307,9 @@ def _make_handler(proxy: AllowanceProxy) -> type[BaseHTTPRequestHandler]:
                 self._send(200, _no_allowance_response(body.get("model", "lab"), prompt_tokens), headers=sized_headers)
                 return
 
-            sized = proxy.sized_body(body, allowance)
+            scope = proxy.scope(task)
+            sized_headers["x-lab-cache-scope"] = scope
+            sized = proxy.sized_body(body, allowance, scope)
             try:
                 if sized.get("stream"):
                     self._stream(sized, entry, task, started, sized_headers)

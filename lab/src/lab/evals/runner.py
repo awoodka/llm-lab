@@ -17,7 +17,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack
-from dataclasses import replace
+from dataclasses import asdict
 from datetime import datetime, timedelta
 from typing import Any
 
@@ -42,15 +42,17 @@ from lab.store import RunDir, find_run
 from lab.telemetry import Telemetry
 
 EVAL_PORT = 8082
-HEALTH_TIMEOUT_S = 900.0
 #: Telemetry every 10 s, published once a minute: a tier runs for hours, so 10 Hz would be millions of rows.
 TELEMETRY_INTERVAL_S = 10.0
 TELEMETRY_PUBLISH_S = 60.0
 #: An infrastructure failure gets this many extra goes before the task is excluded.
 RETRIES = 2
-#: Sampling as the server reports it, so a result can be traced back to how it was produced.
-SAMPLING_KEYS = ("temperature", "top_p", "top_k", "min_p", "typical_p", "repeat_penalty", "repeat_last_n",
-                 "presence_penalty", "frequency_penalty", "mirostat", "seed", "samplers", "dry_multiplier")
+def _say(msg: str) -> None:
+    """Progress, on a pipe that may already be gone: an ssh drop must not kill a run that has hours left."""
+    try:
+        print(msg, file=sys.stderr, flush=True)
+    except OSError:
+        pass
 
 
 class EvalError(RuntimeError):
@@ -75,36 +77,10 @@ def parse_stop_at(value: str | None) -> float | None:
     return time.monotonic() + (target - now).total_seconds()
 
 
-def _props(base_url: str) -> dict[str, Any]:
-    """Sampling and build identity from the live server. Never the model path: runs publish file names."""
-    try:
-        d = httpx.get(f"{base_url}/props", timeout=30).json()
-    except httpx.HTTPError as e:
-        return {"error": str(e)}
-    params = d.get("default_generation_settings", {}).get("params", {})
-    return {
-        "sampling": {k: params[k] for k in SAMPLING_KEYS if k in params},
-        "n_ctx": d.get("default_generation_settings", {}).get("n_ctx") or d.get("n_ctx"),
-        "total_slots": d.get("total_slots"),
-        "build_info": d.get("build_info"),
-        "chat_template_caps": d.get("chat_template_caps"),
-    }
-
-
 def _greedy(props: dict[str, Any]) -> bool:
     """A config that samples greedily gives the same answer every time, so extra attempts buy nothing."""
     s = props.get("sampling") or {}
     return s.get("temperature") == 0 or s.get("top_k") == 1
-
-
-def _launch_config(cfg: ConfigSpec, parallel: int) -> ConfigSpec:
-    """`--parallel N` serves N requests at once, each still getting the config's full context."""
-    if parallel <= 1:
-        return cfg
-    params = replace(cfg.params) if hasattr(cfg.params, "__replace__") else cfg.params.model_copy()
-    params.parallel = parallel
-    params.ctx = cfg.params.ctx * parallel
-    return cfg.model_copy(update={"params": params})
 
 
 class EvalSession:
@@ -252,15 +228,20 @@ class EvalSession:
                 transcripts(bench, task, attempt, record, reply)
                 if record.excluded:
                     excluded.add(task.id)
-                    print(f"  excluded {task.id}: {record.error}", file=sys.stderr)
+                    _say(f"  excluded {task.id}: {record.error}")
 
         if parallel <= 1:
             for job in jobs:
                 work(job)
         else:
-            with ThreadPoolExecutor(max_workers=parallel) as pool:
+            # Not `with`: its exit waits for every in-flight answer, and one may have the whole task
+            # limit left to run. A stop or a Ctrl-C should end the sitting now, not in twenty minutes.
+            pool = ThreadPoolExecutor(max_workers=parallel)
+            try:
                 for future in [pool.submit(work, job) for job in jobs]:
                     future.result()
+            finally:
+                pool.shutdown(wait=False, cancel_futures=True)
 
 
 def run_evals(
@@ -279,9 +260,6 @@ def run_evals(
     cli_args: str = "lab eval",
 ) -> RunDir:
     model, cfg = catalog.load_config(ref)
-    if model.engine != "llama.cpp":
-        # The proxy counts prompt tokens with llama-server's /apply-template and /tokenize, and relaunches with -np.
-        raise EvalError(f"capability evals run on llama.cpp configs only for now; {model.slug} uses {model.engine}")
     prior = find_run(resume).load() if resume else None
     benches = _benchmarks(benchmark_keys, tier, prior)
     deadline = parse_stop_at(stop_at)
@@ -302,7 +280,11 @@ def run_evals(
     engine = get_engine(model.engine)
     _hold_run_to_its_start(rd, bundle, engine, benches, allowance, images, resumed)
     ctx = _ctx(rd, bundle, time.monotonic())
-    launch_cfg = _launch_config(cfg, parallel)
+    dialect = engine.dialect(model, cfg)
+    try:
+        launch_cfg, launch_overrides = dialect.eval_launch(cfg, parallel)
+    except ValueError as e:
+        raise EvalError(str(e)) from e
     argv = engine.server_argv(model, launch_cfg, host="127.0.0.1", port=EVAL_PORT)
     checkpoint = Checkpoint(rd.raw / "attempts.jsonl")
     session_started = time.monotonic()
@@ -310,18 +292,33 @@ def run_evals(
     tel: Telemetry | None = None
     stopped_early = False
 
-    print(f"{'resuming' if resumed else 'starting'} {rd.path.name}: {tier} tier, {', '.join(b.key for b in benches)}", file=sys.stderr)
+    _say(f"{'resuming' if resumed else 'starting'} {rd.path.name}: {tier} tier, {', '.join(b.key for b in benches)}")
     try:
         with exclusive_gpu(f"evals {ref}", wait=wait, keep_paused=keep_paused, cool=False):
             tel = Telemetry(interval_s=TELEMETRY_INTERVAL_S).start()
-            server = ServerProcess(argv, log_path=rd.logs / "llama-server.log")
+            server = ServerProcess(argv, log_path=rd.logs / engine.server_log_name)
             try:
                 tel.watch_pid = server.pid
-                server.wait_healthy(f"http://127.0.0.1:{EVAL_PORT}/health", timeout_s=HEALTH_TIMEOUT_S)
-                props = _props(f"http://127.0.0.1:{EVAL_PORT}")
+                base_url = f"http://127.0.0.1:{EVAL_PORT}"
+                server.wait_healthy(f"{base_url}/health", timeout_s=engine.boot_timeout_s)
+                # A short-lived client for the engine's own questions; harness traffic goes through the proxy.
+                with httpx.Client(timeout=httpx.Timeout(connect=10.0, read=300.0, write=60.0, pool=60.0)) as probe:
+                    # Before the clock matters: the first request of a fresh server pays one-off costs.
+                    wants_tools = any(b.key == "bfcl" for b in benches)
+                    warm = dialect.warmup(probe, base_url, f"{model.slug}/{cfg.slug}", tools=wants_tools)
+                    if wants_tools and warm.tool_calls is False:
+                        raise EvalError(
+                            "the server answered a tool request without a tool call, so a tool benchmark would "
+                            "score this model as unable to use tools. Check the launcher's tool-call parser.")
+                    props = dialect.props(probe, base_url, warm)
+                if props.get("error"):
+                    raise EvalError(
+                        f"the server did not report how it is set up ({props['error']}); a run has to record how it "
+                        "sampled and which tool mode it used, so this would publish a number nobody can trace")
                 attempts_note = None
                 with ExitStack() as stack:
-                    proxy = stack.enter_context(AllowanceProxy(f"http://127.0.0.1:{EVAL_PORT}", allowance, log_path=rd.logs / "requests.jsonl"))
+                    proxy = stack.enter_context(
+                        AllowanceProxy(base_url, allowance, dialect=dialect, log_path=rd.logs / "requests.jsonl"))
                     limit_s = allowance.limit_s or DEEP_LIMIT_S
                     sess = EvalSession(proxy, checkpoint, f"{model.slug}/{cfg.slug}", deadline, request_timeout=limit_s * 4 + 120)
                     sess.box_options = _harness_options(rd, bundle, images, props)
@@ -340,12 +337,12 @@ def run_evals(
                             stopped_early = True
                             break
                         finally:
-                            print("  " + progress(bench, checkpoint.for_benchmark(bench.key), len(subsets[bench.key].tasks)), file=sys.stderr)
+                            _say("  " + progress(bench, checkpoint.for_benchmark(bench.key), len(subsets[bench.key].tasks)))
                     stats = {task: vars(s) for task, s in proxy.stats.tasks.items()}
                     count_mismatches = proxy.count_mismatches
                     if count_mismatches:
-                        print(f"  warning: {count_mismatches} answer(s) where the server counted the prompt differently "
-                              f"from the proxy; see count_mismatch in {rd.logs / 'requests.jsonl'}", file=sys.stderr)
+                        _say(f"  warning: {count_mismatches} answer(s) where the server counted the prompt "
+                             f"differently from the proxy; see count_mismatch in {rd.logs / 'requests.jsonl'}")
             finally:
                 server.stop()
                 tel.stop()
@@ -357,7 +354,7 @@ def run_evals(
             finish_failed(ctx, e, tel)
             raise
         stopped_early = True
-        print(f"\ninterrupted; resume with: lab eval {ref} --tier {tier} --resume {rd.path.name}", file=sys.stderr)
+        _say(f"\ninterrupted; resume with: lab eval {ref} --tier {tier} --resume {rd.path.name}")
         _save_progress(rd, bundle, checkpoint, (session_started, session_started_at, tel), benches, subsets)
         return rd
 
@@ -369,15 +366,16 @@ def run_evals(
         proxy_stats={**(bundle.run.raw.get("proxy_stats") or {}), **stats},
         proxy_count_mismatches=(bundle.run.raw.get("proxy_count_mismatches") or 0) + count_mismatches,
         parallel=parallel,
+        warmup=asdict(warm),
         limited=bool(limit),
-        launch_overrides={"parallel": parallel, "ctx": launch_cfg.params.ctx} if parallel > 1 else {},
+        launch_overrides=launch_overrides,
     )
     if attempts_note:
         bundle.run.raw["attempts_note"] = attempts_note
     _save_progress(rd, bundle, checkpoint, (session_started, session_started_at, tel), benches, subsets)
 
     if stopped_early or not _complete(checkpoint, benches, subsets, attempts_override):
-        print(f"\nsitting over; resume with: lab eval {ref} --tier {tier} --resume {rd.path.name}", file=sys.stderr)
+        _say(f"\nsitting over; resume with: lab eval {ref} --tier {tier} --resume {rd.path.name}")
         return rd
     _finish(rd, bundle, checkpoint, benches, subsets, tel, tier, session_started)
     return rd
@@ -551,7 +549,7 @@ def _finish(rd: RunDir, bundle, checkpoint: Checkpoint, benches, subsets, tel, t
     bundle.run.throttled = bool(bundle.run.throttled or any(s.get("throttled") for s in sessions))
     rd.save(bundle)
     for r in results:
-        print(f"  {r.task}: {r.value:.1%} ± {(r.stderr or 0):.1%} over {r.n_tasks} tasks", file=sys.stderr)
+        _say(f"  {r.task}: {r.value:.1%} ± {(r.stderr or 0):.1%} over {r.n_tasks} tasks")
 
 
 def _harness(bench: Benchmark, subset: Subset) -> tuple[str, str]:

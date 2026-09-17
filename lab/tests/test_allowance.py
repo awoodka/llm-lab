@@ -3,12 +3,14 @@
 import pytest
 
 from lab.evals.allowance import (
+    QUICK_LIMIT_S,
     Allowance,
     NoSpeedRun,
     SpeedPoint,
     from_speed_bundle,
     tg_at_depth,
 )
+from lab.schema import Metric
 
 QWEN_TG = [SpeedPoint(0, 31.8), SpeedPoint(4096, 30.9), SpeedPoint(16384, 28.2)]
 GEMMA_TG = [SpeedPoint(0, 180), SpeedPoint(4096, 175), SpeedPoint(16384, 163)]
@@ -90,3 +92,20 @@ def test_http_chat_metrics_fill_in_when_llama_bench_did_not_measure_a_depth(spee
     a = from_speed_bundle(bundle, limit_s=300)
     assert [p.depth for p in a.tg] == [0, 16384]
     assert a.tg[1].tps == 27.0
+
+
+def test_a_vllm_chat_benchmark_sizes_an_allowance(speed_bundle):
+    """vLLM has no llama-bench, so the HTTP chat run is the speed record an allowance is built from."""
+    bundle = speed_bundle(metrics=[
+        Metric(key="decode_tps", method="http-sampled", value=145.866, unit="t/s", n_gen=1024, concurrency=1),
+        Metric(key="prefill_tps", method="http-sampled", value=741.364, unit="t/s", n_gen=1024, concurrency=1),
+    ])
+    bundle.model.engine = "vllm"
+    a = from_speed_bundle(bundle, limit_s=QUICK_LIMIT_S)
+
+    assert a.pp0 == 741.364 and [p.tps for p in a.tg] == [145.866]
+    assert a.speed_run_id == bundle.run.id
+    # One measured depth, so the same speed is assumed everywhere — generous deep in a long context.
+    assert a.for_prompt(8000, spent_s=0, cached_tokens=0) == a.for_prompt(8000, spent_s=0, cached_tokens=0)
+    deep = a.for_prompt(40000, spent_s=0, cached_tokens=0)
+    assert deep > 0 and deep <= 65536 - 40000

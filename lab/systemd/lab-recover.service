@@ -1,0 +1,6 @@
+[Unit]
+Description=lab: put chat back if a GPU job died while it was paused
+
+[Service]
+Type=oneshot
+ExecStart=%h/llm-lab/lab/.venv/bin/lab hosted recover
