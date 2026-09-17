@@ -43,11 +43,13 @@ class ModelSpec(Strict):
     slug: str
     name: str
     base: str
-    engine: Literal["llama.cpp", "exllamav3"] = "llama.cpp"
+    engine: Literal["llama.cpp", "exllamav3", "vllm"] = "llama.cpp"
     format: str = "gguf"
     quant: str
     bpw: float | None = None
     source: Source
+    #: Other pinned inputs the weights were built from (repo@revision, file hashes). Part of config_hash when set.
+    artifacts: dict[str, str] | None = None
     notes: str | None = None
 
 
@@ -81,6 +83,29 @@ class Params(Strict):
     extra_args: list[str] = Field(default_factory=list)
 
 
+class VllmParams(Strict):
+    """Knobs of the syv-ai launcher (single-user/start_qwen.sh), each rendered as its env var so launcher defaults never leak in."""
+
+    launcher: str  # script path inside paths.QWEN_SERVING
+    launcher_commit: str  # full SHA of that checkout; an upgrade means a new config slug
+    ctx: int = 65536  # MAX_LEN; checked against the server's max_model_len after boot
+    spec: str = "dflash2"  # SPEC
+    ctx_profile: str = "fast"  # CTX
+    prefix_cache: bool = True  # PREFIX_CACHE; off also passes --no-enable-prefix-caching, which vLLM otherwise enables
+    kv_mem: int = 5583457484  # KV_MEM, bytes of KV pool
+    max_seqs: int = 8  # MAX_SEQS
+    gpu_util: float = 0.93  # GPU_UTIL
+    dflash_tokens: int = 7  # DFLASH_TOKENS
+    lookup: bool = True  # LOOKUP
+    tools: bool = True  # TOOLS
+    vision: bool = False  # VISION
+    cudagraph_mode: str | None = None  # CUDAGRAPH_MODE; unset keeps the launcher's choice
+    draft: str | None = None  # DRAFT, a directory inside the checkout
+    load_format: str = "auto"
+    env: dict[str, str] = Field(default_factory=dict)
+    extra_args: list[str] = Field(default_factory=list)
+
+
 class BenchSpec(Strict):
     n_prompt: int = 512
     n_gen: int = 128
@@ -94,7 +119,7 @@ class ConfigSpec(Strict):
     slug: str
     name: str
     notes: str | None = None
-    params: Params = Field(default_factory=Params)
+    params: Params | VllmParams = Field(default_factory=Params, union_mode="left_to_right")
     bench: BenchSpec = Field(default_factory=BenchSpec)
     eval_overrides: dict[str, Any] = Field(default_factory=dict)
 
@@ -162,7 +187,9 @@ def resolve_model_path(spec: ModelSpec, download: bool = False) -> Path:
     """Local path to the weights (GGUF file or EXL3 directory)."""
     src = spec.source
     if src.path:
-        return Path(src.path)
+        path = Path(src.path)
+        # vLLM weights live in the launcher checkout's models/, so a relative path is relative to that checkout.
+        return path if path.is_absolute() or spec.engine != "vllm" else paths.QWEN_SERVING / path
     if not src.repo:
         raise ValueError(f"model {spec.slug} has neither source.path nor source.repo")
     from huggingface_hub import hf_hub_download, snapshot_download
@@ -191,7 +218,10 @@ def load_config(ref: str) -> tuple[ModelSpec, ConfigSpec]:
     p = config_path(model_slug, config_slug)
     if not p.is_file():
         raise KeyError(f"unknown config {ref!r} (expected {p})")
-    return model, ConfigSpec.model_validate(_load_yaml(p))
+    cfg = ConfigSpec.model_validate(_load_yaml(p))
+    if (model.engine == "vllm") != isinstance(cfg.params, VllmParams):
+        raise ValueError(f"config {ref!r} has {type(cfg.params).__name__} but model {model.slug} runs on {model.engine}")
+    return model, cfg
 
 
 def save_config(model_slug: str, cfg: ConfigSpec) -> Path:
@@ -209,9 +239,10 @@ def list_configs(model_slug: str) -> list[ConfigSpec]:
 
 def config_hash(model: ModelSpec, cfg: ConfigSpec) -> str:
     """Identity of what was measured: weights (slug + revision) + every knob."""
-    return canonical_hash(
-        {"model": model.slug, "revision": model.source.revision, "params": cfg.params.model_dump(mode="json")}
-    )
+    identity = {"model": model.slug, "revision": model.source.revision, "params": cfg.params.model_dump(mode="json")}
+    if model.artifacts:
+        identity["artifacts"] = model.artifacts
+    return canonical_hash(identity)
 
 
 # -- conversions to the publish contract --------------------------------------

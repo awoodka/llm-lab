@@ -38,6 +38,7 @@ def calls(tmp_path, monkeypatch):
     monkeypatch.setattr(hosted, "stop_hosted", lambda: calls.append("stop"))
     monkeypatch.setattr(hosted, "wait_gpu_idle", lambda: None)
     monkeypatch.setattr(publish, "put_hosted", lambda config_hash: calls.append("put_hosted"))
+    monkeypatch.setattr(publish, "put_pause", lambda paused, reason=None, ref=None: calls.append(("pause", paused, reason, ref)))
     return calls
 
 
@@ -47,14 +48,19 @@ def _hosted_ref() -> str:
 
 def _start_with(monkeypatch, calls, *healthy):
     answers = iter(healthy)
-    monkeypatch.setattr(hosted, "start_hosted", lambda wait_health=True: calls.append(("start", _hosted_ref())) or next(answers))
+    def start(wait_health=True, timeout_s=600):
+        calls.append(("start", _hosted_ref(), timeout_s))
+        return next(answers)
+
+    monkeypatch.setattr(hosted, "start_hosted", start)
 
 
 def test_promote_switches_the_hosted_model_and_tells_the_site(calls, monkeypatch):
     _start_with(monkeypatch, calls, True)
     result = CliRunner().invoke(cli.app, ["promote", NEW])
     assert result.exit_code == 0, result.output
-    assert calls == ["stop", ("start", NEW), "put_hosted"]
+    assert calls == ["stop", ("pause", True, "starting", NEW), ("start", NEW, 300), "put_hosted", ("pause", False, None, None)]
+    assert json.loads(paths.HOSTED_JSON.read_text())["engine"] == "llama.cpp"
     assert "/models/new-q4_k_m-gguf.gguf" in paths.HOSTED_SH.read_text()
 
 
@@ -63,7 +69,8 @@ def test_failed_promote_rolls_back_to_the_previous_model(calls, monkeypatch):
     result = CliRunner().invoke(cli.app, ["promote", NEW])
     assert result.exit_code == 1
     assert f"rolled back to {OLD}, which is healthy again" in result.output
-    assert calls == ["stop", ("start", NEW), "stop", ("start", OLD)]
+    assert [c for c in calls if c[0] != "pause"] == ["stop", ("start", NEW, 300), "stop", ("start", OLD, 300)]
+    assert ("pause", True, "starting", OLD) in calls
     assert _hosted_ref() == OLD and paths.HOSTED_SH.read_text() == "#!/bin/sh\nexec old\n"
 
 
@@ -72,7 +79,7 @@ def test_failed_re_promote_of_the_same_model_just_stops(calls, monkeypatch):
     result = CliRunner().invoke(cli.app, ["promote", OLD])
     assert result.exit_code == 1
     assert "no previous model to roll back to" in result.output
-    assert calls == ["stop", ("start", OLD), "stop"]
+    assert [c for c in calls if c[0] != "pause"] == ["stop", ("start", OLD, 300), "stop"]
 
 
 def test_promote_refuses_above_the_power_cap_without_touching_anything(calls, monkeypatch):

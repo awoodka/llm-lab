@@ -1,0 +1,18 @@
+slug: qwen3.8-27b-w4a16-autoround-fast
+name: Qwen3.8 27B W4A16 AutoRound
+base: qwen3.8-27b
+engine: vllm
+format: safetensors
+quant: W4A16
+source:
+  repo: dbirks/Qwen3.8-27B-W4A16-AutoRound
+  revision: 1f05c441c4e64ae0549de44fa9ea5a6d43610314
+  path: models/Qwen3.8-27B-W4A16-AutoRound-fast
+artifacts:
+  fast_variant: syvai/qwen3.8-27b-3090-fast-variant@124c14e7e8c7d2f5402933b9af368e772a9fcf0c
+  draft: syvai/Qwen3.8-27B-DFlash2-W4A16@4d30ec736ffc6b8688dc2ae2b502d9b48bdec279
+  fast_shard6_sha256: b2e0854ed3be3141ed79f4204f7aa8e616da626d4662017117330490747c2036
+notes: Qwen's Qwen3.8 27B, quantized to 4-bit weights by dbirks (AutoRound). The syv-ai/qwen38-27b-rtx3090
+  scripts requantize its lm_head, embeddings and multi-token-prediction head and add
+  syv-ai's fast-variant shards; it serves on syv-ai's patched vLLM 0.28.0 with their
+  DFlash2 W4A16 draft model.

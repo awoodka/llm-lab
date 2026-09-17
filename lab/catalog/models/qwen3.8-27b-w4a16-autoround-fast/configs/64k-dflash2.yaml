@@ -1,0 +1,35 @@
+slug: 64k-dflash2
+name: 64k ctx, DFlash2 speculative decoding
+notes: 'Hosted chat config: syv-ai''s single-user profile SPEC=dflash2 PREFIX_CACHE=1
+  CTX=fast (64k context, bf16 KV cache in a 5.2 GiB pool, 8 request slots).'
+params:
+  launcher: single-user/start_qwen.sh
+  launcher_commit: bae2023ffc98753d337d2d2041784a277599a4c4
+  ctx: 65536
+  spec: dflash2
+  ctx_profile: fast
+  prefix_cache: true
+  kv_mem: 5583457484
+  max_seqs: 8
+  gpu_util: 0.93
+  dflash_tokens: 7
+  lookup: true
+  tools: true
+  vision: false
+  draft: models/Qwen3.8-27B-DFlash2-W4A16
+  load_format: auto
+  env: {}
+  extra_args: []
+bench:
+  n_prompt: 512
+  n_gen: 128
+  depths:
+  - 0
+  - 4096
+  - 16384
+  reps: 5
+  delay_s: 3
+  http_prompt_lengths:
+  - 512
+  - 4096
+eval_overrides: {}

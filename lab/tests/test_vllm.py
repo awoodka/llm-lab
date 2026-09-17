@@ -1,0 +1,165 @@
+import subprocess
+from pathlib import Path
+
+import pytest
+
+from lab import catalog, paths, publish
+from lab.catalog import ConfigSpec, ModelSpec, Params, Source, VllmParams
+from lab.engines.base import get_engine
+from lab.engines.vllm import CheckoutMismatch, Vllm
+
+SHA = "bae2023ffc98753d337d2d2041784a277599a4c4"
+REF = "qwen3.8-27b-w4a16-autoround-fast/64k-dflash2"
+
+
+def _git(root: Path, *args: str) -> str:
+    return subprocess.run(["git", "-C", str(root), *args], capture_output=True, text=True, check=True).stdout.strip()
+
+
+@pytest.fixture
+def checkout(tmp_path):
+    """A stand-in launcher repo: one commit, a patch series with a superseded patch, a venv with a tiny vllm package."""
+    root = tmp_path / "qwen-serving"
+    site = root / "venv/lib/python3.12/site-packages/vllm"
+    site.mkdir(parents=True)
+    (site / "a.py").write_text("x = 1\nnew line that the first patch added here\n")
+    (site / "b.py").write_text("y = 2\nrewritten by the second patch, long enough to count\n")
+    patches = root / "patches"
+    patches.mkdir()
+    (patches / "series").write_text("# order\nfirst.patch\nold.patch\ndflash2-backport.patch\nnew.patch\n")
+    (patches / "first.patch").write_text(
+        "--- a/a.py\n+++ b/a.py\n@@ -1 +1,2 @@\n x = 1\n+new line that the first patch added here\n"
+    )
+    (patches / "old.patch").write_text(
+        "--- a/b.py\n+++ b/b.py\n@@ -1 +1,2 @@\n y = 2\n+the old patch's line, which the new one replaced\n"
+    )
+    (patches / "new.patch").write_text(
+        "Supersedes: old.patch\n--- a/b.py\n+++ b/b.py\n@@ -1 +1,2 @@\n y = 2\n+rewritten by the second patch, long enough to count\n"
+    )
+    (patches / "_check_applied.py").write_text("import sys\nsys.exit(1)\n")
+    (root / "venv/bin").mkdir(parents=True)
+    (root / "venv/bin/python").symlink_to(Path(subprocess.run(["which", "python3"], capture_output=True, text=True).stdout.strip()))
+    (root / "single-user").mkdir()
+    (root / "single-user/start_qwen.sh").write_text("#!/bin/bash\n")
+    _git(root.parent, "init", "-q", str(root))
+    _git(root, "-c", "user.email=t@t", "-c", "user.name=t", "add", "patches", "single-user")
+    _git(root, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "pin")
+    return root
+
+
+def _model() -> ModelSpec:
+    return ModelSpec(
+        slug="qwen3.8-27b-w4a16-autoround-fast", name="Q", base="qwen3.8-27b", engine="vllm", format="safetensors",
+        quant="W4A16", source=Source(repo="dbirks/x", revision="r1", path="models/fast"), artifacts={"draft": "syvai/d@r2"},
+    )
+
+
+def _cfg(commit: str, **params) -> ConfigSpec:
+    return ConfigSpec(slug="64k-dflash2", name="c", params=VllmParams(launcher="single-user/start_qwen.sh", launcher_commit=commit,
+                                                                      draft="models/draft", **params))
+
+
+def test_server_argv_renders_every_knob_on_localhost_without_a_key(checkout, monkeypatch):
+    monkeypatch.setattr(paths, "QWEN_SERVING", checkout)
+    eng = Vllm(root=checkout)
+    argv = eng.server_argv(_model(), _cfg(_git(checkout, "rev-parse", "HEAD")), host="127.0.0.1", port=8080)
+    assert argv[:3] == ["env", "-u", "VLLM_API_KEY"]
+    assert argv[-2:] == ["/bin/bash", str(checkout / "single-user/start_qwen.sh")]
+    env = dict(a.split("=", 1) for a in argv[3:-2])
+    assert env == {
+        "HOST": "127.0.0.1", "PORT": "8080", "MODEL": str(checkout / "models/fast"), "SPEC": "dflash2", "CTX": "fast",
+        "MAX_LEN": "65536", "PREFIX_CACHE": "1", "KV_MEM": "5583457484", "MAX_SEQS": "8", "GPU_UTIL": "0.93",
+        "DFLASH_TOKENS": "7", "LOOKUP": "1", "TOOLS": "1", "VISION": "0", "DRAFT": str(checkout / "models/draft"),
+        "EXTRA_ARGS": "--served-model-name qwen3.8-27b-w4a16-autoround-fast/64k-dflash2 --load-format auto",
+    }  # fmt: skip
+
+
+def test_prefix_cache_off_is_really_off():
+    env = Vllm(root=Path("/q")).launch_env(_model(), _cfg(SHA, prefix_cache=False), host="127.0.0.1", port=1, weights="w", draft=None)
+    assert env["PREFIX_CACHE"] == "0" and env["EXTRA_ARGS"].endswith("--no-enable-prefix-caching")
+
+
+@pytest.mark.parametrize(("params", "match"), [
+    (dict(env={"HOST": "0.0.0.0"}), "may not set HOST"),
+    (dict(env={"VLLM_API_KEY": "x"}), "may not set VLLM_API_KEY"),
+    (dict(extra_args=["--chat-template", "a b"]), "splits EXTRA_ARGS"),
+])  # fmt: skip
+def test_launch_env_refuses_what_the_launcher_would_mangle_or_expose(params, match):
+    with pytest.raises(ValueError, match=match):
+        Vllm(root=Path("/q")).launch_env(_model(), _cfg(SHA, **params), host="127.0.0.1", port=1, weights="w", draft=None)
+
+
+def test_refuses_an_unpinned_checkout_or_a_key_file(checkout):
+    eng = Vllm(root=checkout)
+    with pytest.raises(CheckoutMismatch, match="pins bae2023ffc98"):
+        eng.server_argv(_model(), _cfg(SHA), host="127.0.0.1", port=8080)
+    (checkout / "api_key.txt").write_text("secret")
+    with pytest.raises(CheckoutMismatch, match="api_key.txt"):
+        eng.check_checkout(_cfg(_git(checkout, "rev-parse", "HEAD")).params)
+
+
+def test_display_command_has_no_paths_and_passes_publish_checks():
+    shown = Vllm(root=Path("/home/alex/qwen-serving")).display_command(_model(), _cfg(SHA))
+    assert shown.startswith("HOST=127.0.0.1 PORT=8080 MODEL=models/fast SPEC=dflash2 ")
+    assert shown.endswith(" single-user/start_qwen.sh") and "DRAFT=models/draft" in shown
+    publish.check_no_local_paths({"cmd": shown})
+    publish.check_no_secrets({"cmd": shown})
+
+
+@pytest.mark.parametrize("text", ["VLLM_API_KEY=abc", "--api-key abc", "Authorization: Bearer abcdef123456", "hf_" + "a" * 30])
+def test_publish_refuses_credentials(text):
+    with pytest.raises(publish.PublishError, match="credential"):
+        publish.check_no_secrets({"cmd": text})
+
+
+def test_publish_allows_words_that_merely_mention_keys():
+    publish.check_no_secrets({"doc": "get_weather(api_key: str) — pass your API key; VLLM_API_KEY is unset"})
+
+
+def test_params_union_picks_the_right_type_both_ways():
+    llama = ConfigSpec.model_validate({"slug": "a", "name": "a", "params": {"ctx": 32768}})
+    vllm = ConfigSpec.model_validate({"slug": "b", "name": "b", "params": {"launcher": "s.sh", "launcher_commit": SHA}})
+    assert type(llama.params) is Params and type(vllm.params) is VllmParams
+    assert type(ConfigSpec(slug="c", name="c").params) is Params
+    with pytest.raises(ValueError):
+        ConfigSpec.model_validate({"slug": "d", "name": "d", "params": {"launcher": "s.sh"}})
+
+
+def test_load_config_refuses_an_engine_params_mismatch(tmp_path, monkeypatch):
+    monkeypatch.setattr(paths, "CATALOG", tmp_path)
+    catalog.save_model(_model())
+    catalog.save_config(_model().slug, ConfigSpec(slug="wrong", name="w", params=Params()))
+    with pytest.raises(ValueError, match="runs on vllm"):
+        catalog.load_config(f"{_model().slug}/wrong")
+
+
+def test_llamacpp_config_hash_is_unchanged_and_vllm_hashes_its_artifacts():
+    assert catalog.config_hash(*catalog.load_config("qwen3.8-27b-q4_k_m-gguf/64k-q8kv")) == (
+        "3c7251bf69b58420f30b9f7aeb21cb19753a94e7216986aa0e12684a4912b76a"
+    )
+    model, cfg = catalog.load_config(REF)
+    assert type(cfg.params) is VllmParams and model.engine == "vllm"
+    other = model.model_copy(update={"artifacts": {**model.artifacts, "draft": "syvai/other@r"}})
+    assert catalog.config_hash(model, cfg) != catalog.config_hash(other, cfg)
+
+
+def test_patch_status_follows_supersedes_and_skips_retired(checkout):
+    applied, missing = Vllm(root=checkout).patch_status()
+    assert (applied, missing) == (3, [])
+    (checkout / "venv/lib/python3.12/site-packages/vllm/a.py").write_text("x = 1\n")
+    assert Vllm(root=checkout).patch_status() == (2, ["first.patch"])
+
+
+def test_build_info_records_the_checkout(checkout):
+    b = Vllm(root=checkout).build_info()
+    assert b.engine == "vllm" and b.commit_sha == _git(checkout, "rev-parse", "--short=9", "HEAD")
+    assert b.extra["launcher_commit"] == _git(checkout, "rev-parse", "HEAD") and b.extra["dirty"] is False
+    assert b.extra["patches_applied"] == 3 and b.extra["patches_missing"] == []
+    assert len(b.extra["patch_series_sha256"]) == 64
+
+
+def test_engines_carry_boot_timeouts_and_cache_busting_extras():
+    llama, vllm = get_engine("llama.cpp"), get_engine("vllm")
+    assert llama.boot_timeout_s < vllm.boot_timeout_s == 1500
+    assert llama.request_extras() == {"cache_prompt": False}
+    assert vllm.request_extras()["cache_salt"] != vllm.request_extras()["cache_salt"]

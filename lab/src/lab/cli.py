@@ -120,6 +120,9 @@ def doctor() -> None:
         line(not b.extra.get("dirty"), "llama.cpp", f"{b.commit_sha} build {b.version} {'(DIRTY tree)' if b.extra.get('dirty') else ''}")
     except Exception as e:  # noqa: BLE001
         line(False, "llama.cpp", str(e))
+    vllm_models = [m for m in catalog.list_models() if m.engine == "vllm"]
+    if vllm_models:
+        _doctor_vllm(line, vllm_models)
     models_on_nvme = paths.MODELS == Path("/mnt/models")
     paths.MODELS.mkdir(parents=True, exist_ok=True)
     free = shutil.disk_usage(paths.MODELS).free / 2**30
@@ -134,6 +137,36 @@ def doctor() -> None:
     except Exception as e:  # noqa: BLE001
         line(False, "web", str(e))
     raise typer.Exit(0 if ok else 1)
+
+
+def _doctor_vllm(line, models: list[ModelSpec]) -> None:
+    from lab.catalog import VllmParams
+    from lab.engines.vllm import Vllm
+
+    eng = Vllm()
+    try:
+        b = eng.build_info()
+    except Exception as e:  # noqa: BLE001
+        line(False, "vllm", f"{eng.root}: {e}")
+        return
+    x = b.extra
+    configs = [(m, c) for m in models for c in catalog.list_configs(m.slug) if isinstance(c.params, VllmParams)]
+    pins = {c.params.launcher_commit for _, c in configs}
+    head = x.get("launcher_commit") or ""
+    line(bool(b.version) and head in pins and not x["dirty"] and not x["patches_missing"], "vllm",
+         f"{b.version} at {head[:9]} ({'pinned' if head in pins else 'NOT the pinned ' + ', '.join(p[:9] for p in pins)}), "
+         f"{x['patches_applied']} patches{', missing ' + ', '.join(x['patches_missing']) if x['patches_missing'] else ''}"
+         f"{', DIRTY tree' if x['dirty'] else ''}; torch {x.get('torch')}")
+    for m in models:
+        weights = catalog.resolve_model_path(m)
+        line(weights.is_dir(), "vllm weights", f"{m.slug}: {weights}")
+    for m, c in configs:
+        if c.params.draft:
+            line((eng.root / c.params.draft).is_dir(), "vllm draft", f"{m.slug}/{c.slug}: {c.params.draft}")
+    line(not (eng.root / "api_key.txt").exists(), "vllm api key", "none (the lab never sends one)")
+    memlock = subprocess.run(["systemctl", "--user", "show", hosted.UNIT, "-p", "LimitMEMLOCK", "--value"], capture_output=True, text=True).stdout.strip()
+    events = dict(ln.split() for ln in Path("/sys/fs/cgroup/memory.events").read_text().splitlines())
+    line(True, "memory", f"user-unit memlock {memlock or '?'} B; oom_kill events in this container: {events.get('oom_kill', '?')}")
 
 
 # -- models ------------------------------------------------------------------
@@ -232,13 +265,14 @@ def serve(
     argv = get_engine(model.engine).server_argv(model, cfg, host=host, port=port)
     typer.echo(shlex.join(argv))
     _check_power()
+    from lab.engines.process import ServerProcess
+
     with hosted.exclusive_gpu(f"serve {ref}", wait=wait, cool=False):
-        proc = subprocess.Popen(argv)
+        server = ServerProcess(argv)
         try:
-            proc.wait()
+            server.wait()
         except KeyboardInterrupt:
-            proc.terminate()
-            proc.wait()
+            server.stop()
 
 
 @app.command()
@@ -411,14 +445,16 @@ def _rollback_promote(ref: str, previous: dict[Path, str]) -> None:
     """`ref` never became healthy: end the unit's restart loop and bring back the model hosted before it."""
     hosted.stop_hosted()
     logs = f"journalctl --user -u {hosted.UNIT} -n 50"
-    prev_ref = json.loads(previous.get(paths.HOSTED_JSON, "{}")).get("ref")
+    prev = json.loads(previous.get(paths.HOSTED_JSON, "{}"))
+    prev_ref = prev.get("ref")
     if not prev_ref or prev_ref == ref:
         _fail(f"{ref} failed to become healthy and there is no previous model to roll back to; the hosted model is stopped. See: {logs}")
     for p, text in previous.items():
         p.write_text(text)
     if paths.HOSTED_SH in previous:
         paths.HOSTED_SH.chmod(0o755)
-    healthy = hosted.start_hosted(wait_health=True)
+    hosted.report_starting(prev_ref)
+    healthy = hosted.start_hosted(wait_health=True, timeout_s=get_engine(prev.get("engine", "llama.cpp")).boot_timeout_s)
     _fail(f"{ref} failed to become healthy (see: {logs}); rolled back to {prev_ref}, "
           f"which is {'healthy again' if healthy else 'NOT healthy either'}")
 
@@ -436,19 +472,21 @@ def promote(ref: str) -> None:
             hosted.stop_hosted()
         paths.HOSTED_SH.write_text(f"#!/bin/sh\nexec {shlex.join(argv)}\n")
         paths.HOSTED_SH.chmod(0o755)
-        state = {"ref": ref, "config_hash": catalog.config_hash(model, cfg), "port": HOSTED_PORT,
+        state = {"ref": ref, "engine": model.engine, "config_hash": catalog.config_hash(model, cfg), "port": HOSTED_PORT,
                  "since": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
         paths.HOSTED_JSON.write_text(json.dumps(state, indent=2))
         _install_unit()
         hosted.wait_gpu_idle()
-    typer.echo(f"starting {ref} on 127.0.0.1:{HOSTED_PORT}…")
-    if not hosted.start_hosted(wait_health=True):
+    typer.echo(f"starting {ref} on 127.0.0.1:{HOSTED_PORT} (allowing {engine.boot_timeout_s / 60:.0f} min to boot)…")
+    hosted.report_starting(ref)
+    if not hosted.start_hosted(wait_health=True, timeout_s=engine.boot_timeout_s):
         _rollback_promote(ref, previous)
     typer.echo("healthy")
     try:
-        from lab.publish import put_hosted
+        from lab.publish import put_hosted, put_pause
 
         put_hosted(state["config_hash"])
+        put_pause(False)
     except Exception as e:  # noqa: BLE001
         typer.secho(f"note: site not updated ({e})", fg="yellow")
 

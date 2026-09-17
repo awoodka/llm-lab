@@ -279,6 +279,9 @@ def run_evals(
     cli_args: str = "lab eval",
 ) -> RunDir:
     model, cfg = catalog.load_config(ref)
+    if model.engine != "llama.cpp":
+        # The proxy counts prompt tokens with llama-server's /apply-template and /tokenize, and relaunches with -np.
+        raise EvalError(f"capability evals run on llama.cpp configs only for now; {model.slug} uses {model.engine}")
     prior = find_run(resume).load() if resume else None
     benches = _benchmarks(benchmark_keys, tier, prior)
     deadline = parse_stop_at(stop_at)

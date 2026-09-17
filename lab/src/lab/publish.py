@@ -33,6 +33,16 @@ def check_no_local_paths(payload: dict) -> None:
         raise PublishError(f"bundle contains a local path ({excerpt!r}); publish file names only")
 
 
+# Credentials a launch command or env dict could carry. The ingest token is sent as a header, never in the bundle.
+SECRET_RE = re.compile(r"VLLM_API_KEY=\S|--api-key[= ]\S|Bearer\s+[\w.~+/-]{8,}|\bhf_[A-Za-z0-9]{20,}|\bsk-[A-Za-z0-9_-]{16,}")
+
+
+def check_no_secrets(payload: dict) -> None:
+    text = json.dumps(payload)
+    if m := SECRET_RE.search(text):
+        raise PublishError(f"bundle looks like it carries a credential near {text[max(0, m.start() - 30) : m.start() + 12]!r}…; remove it")
+
+
 def settings() -> tuple[str, str]:
     file = yaml.safe_load(paths.SETTINGS.read_text()) if paths.SETTINGS.is_file() else {}
     url = os.environ.get("LAB_WEB_URL") or file.get("web_url")
@@ -66,6 +76,7 @@ def publish(rd: RunDir, dry_run: bool = False, replace: bool = False) -> dict:
     payload = bundle.model_dump(mode="json")
     payload["bundle_sha"] = bundle.content_sha()
     check_no_local_paths(payload)
+    check_no_secrets(payload)
     if dry_run:
         return {"dry_run": True, "run_id": bundle.run.id, "metrics": len(bundle.metrics), "bytes": len(str(payload))}
     client, url = _client()

@@ -133,6 +133,17 @@ def _report_pause(paused: bool, purpose: str = "") -> None:
         pass
 
 
+def report_starting(ref: str | None = None) -> None:
+    """Tell the site the hosted model is loading. vLLM takes minutes, and the site's health probe alone would say offline."""
+    try:
+        from lab.publish import put_pause
+
+        state = hosted_state()
+        put_pause(True, "starting", ref or (state or {}).get("ref"))
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def recover_paused_hosted() -> bool:
     """If a GPU job died without resuming the hosted model, resume it. Returns True if it acted."""
     try:
@@ -144,7 +155,9 @@ def recover_paused_hosted() -> bool:
     PAUSED_BY.unlink(missing_ok=True)
     if not hosted_active():
         print(f"recovering: restarting hosted model paused by dead job {info}", file=sys.stderr)
-        start_hosted(wait_health=False)
+        if start_hosted(wait_health=False):
+            report_starting()
+            return True
     _report_pause(False)
     return True
 
@@ -169,8 +182,9 @@ def exclusive_gpu(purpose: str, wait: bool = False, keep_paused: bool = False, c
             yield
     finally:
         if was_active:
-            if not keep_paused:
+            if not keep_paused and start_hosted(wait_health=False):
                 print("resuming hosted model…", file=sys.stderr)
-                start_hosted(wait_health=False)
-            _report_pause(False)
+                report_starting()
+            else:
+                _report_pause(False)
         PAUSED_BY.unlink(missing_ok=True)

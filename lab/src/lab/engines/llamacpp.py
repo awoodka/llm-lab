@@ -39,6 +39,7 @@ def bench_depths(cfg: ConfigSpec) -> list[int]:
 
 class LlamaCpp:
     name = "llama.cpp"
+    boot_timeout_s = 300
 
     def __init__(self, root: Path | None = None):
         self.root = root or paths.LLAMA_CPP
@@ -89,6 +90,9 @@ class LlamaCpp:
 
     def render_files(self, model: ModelSpec, cfg: ConfigSpec) -> dict[str, str]:
         return {}
+
+    def request_extras(self) -> dict:
+        return {"cache_prompt": False}
 
     # -- bench -----------------------------------------------------------------
     def bench_argv(self, weights: Path, cfg: ConfigSpec) -> list[str]:

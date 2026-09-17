@@ -25,3 +25,5 @@ REFS = MODELS / "refs"
 DATASETS = MODELS / "datasets"
 
 LLAMA_CPP = Path(os.environ.get("LAB_LLAMA_CPP", Path.home() / "llama.cpp"))
+# The syv-ai vLLM stack: a pinned clone with its own venv and models/. An upgrade is a new clone and a new symlink.
+QWEN_SERVING = Path(os.environ.get("LAB_QWEN_SERVING", Path.home() / "qwen-serving"))

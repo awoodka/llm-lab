@@ -13,6 +13,8 @@ from lab.gpu import hosted
 def isolated(tmp_path, monkeypatch):
     monkeypatch.setattr(paths, "SETTINGS", tmp_path / "settings.yaml")
     monkeypatch.setattr(hosted, "PAUSED_BY", tmp_path / "paused_by.json")
+    monkeypatch.setattr(paths, "HOSTED_JSON", tmp_path / "hosted.json")
+    (tmp_path / "hosted.json").write_text(json.dumps({"ref": "qwen/64k", "port": 8080}))
     monkeypatch.delenv("LAB_WEB_URL", raising=False)
     monkeypatch.delenv("LAB_INGEST_TOKEN", raising=False)
 
@@ -57,7 +59,7 @@ def _fake_gpu(monkeypatch, calls, *, active=True, report_error=False):
     monkeypatch.setattr(hosted, "check_power_limit", lambda: calls.append("power"))
     monkeypatch.setattr(hosted, "hosted_active", lambda: active)
     monkeypatch.setattr(hosted, "stop_hosted", lambda: calls.append("stop"))
-    monkeypatch.setattr(hosted, "start_hosted", lambda wait_health=True: calls.append("start") or True)
+    monkeypatch.setattr(hosted, "start_hosted", lambda wait_health=True, timeout_s=600: calls.append("start") or True)
     monkeypatch.setattr(hosted, "wait_gpu_idle", lambda: calls.append("idle"))
     monkeypatch.setattr(hosted, "wait_cool", lambda: calls.append("cool"))
     monkeypatch.setattr(publish, "put_pause", fake_put_pause)
@@ -69,8 +71,17 @@ def test_exclusive_gpu_reports_the_pause_before_waiting_and_the_resume_after(mon
     with hosted.exclusive_gpu("bench speed gemma/32k-q8kv"):
         calls.append("body")
     assert calls == [
-        "lock", "power", "stop", ("pause", True, "bench", "gemma/32k-q8kv"), "idle", "cool", "body", "start", ("pause", False, None, None),
+        "lock", "power", "stop", ("pause", True, "bench", "gemma/32k-q8kv"), "idle", "cool", "body", "start",
+        ("pause", True, "starting", "qwen/64k"),
     ]
+
+
+def test_keep_paused_reports_the_pause_over_without_starting(monkeypatch):
+    calls = []
+    _fake_gpu(monkeypatch, calls)
+    with hosted.exclusive_gpu("bench speed gemma/32k-q8kv", keep_paused=True):
+        pass
+    assert "start" not in calls and calls[-1] == ("pause", False, None, None)
 
 
 def test_power_limit_refusal_leaves_the_hosted_model_alone(monkeypatch):
