@@ -278,16 +278,27 @@ def serve(
 @app.command()
 def bench(
     ref: str,
-    speed: bool = typer.Option(False, "--speed", help="llama-bench native speed (default if nothing selected)"),
-    reps: int | None = typer.Option(None, help="Override bench.reps"),
+    speed: bool = typer.Option(False, "--speed", help="llama-bench native speed (llama.cpp only; its default)"),
+    http: bool = typer.Option(False, "--http", help="Chat benchmark over the server's API, any engine (vLLM's default)"),
+    reps: int | None = typer.Option(None, help="Override bench.reps (llama-bench)"),
     wait: bool = typer.Option(False, help="Queue behind a held GPU lock instead of failing"),
     keep_paused: bool = typer.Option(False, help="Leave the hosted model stopped afterwards"),
 ) -> None:
     """Benchmark a config and store a local run (publish separately)."""
-    from lab.bench.native_llamacpp import run_speed
-
+    if speed and http:
+        _fail("pick one of --speed and --http; each is its own run")
+    model, _ = catalog.load_config(ref)
+    if not speed and not http:
+        http = model.engine != "llama.cpp"
     _check_power()
-    rd = run_speed(ref, wait=wait, keep_paused=keep_paused, reps=reps, cli_args=_cli_args())
+    if http:
+        from lab.bench.http_chat import run_http
+
+        rd = run_http(ref, wait=wait, keep_paused=keep_paused, cli_args=_cli_args())
+    else:
+        from lab.bench.native_llamacpp import run_speed
+
+        rd = run_speed(ref, wait=wait, keep_paused=keep_paused, reps=reps, cli_args=_cli_args())
     _print_run(rd)
     typer.echo(f"\nrun saved: {rd.path}\npublish with: lab publish {rd.path.name}")
 
