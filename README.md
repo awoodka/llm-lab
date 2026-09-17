@@ -40,7 +40,8 @@ uv run lab promote qwen3-30b-a3b-q4_k_m-gguf/32k-q8kv
 Guarantees:
 - Every knob is rendered explicitly, including `--fit off`, `-np` and `--cache-ram`, so engine defaults never leak into results.
 - Configs are hash-locked: the site refuses a config slug that is republished with different settings.
-- GPU jobs take `state/gpu.lock`, stop the hosted model, wait for idle VRAM and a GPU below 45 °C, then restart the hosted model afterwards, even after a crash (on the next `lab` command).
+- GPU jobs take `state/gpu.lock`, stop the hosted model, wait for idle VRAM and a GPU below 45 °C, then restart the hosted model afterwards, even after a crash: `lab-recover.timer` puts chat back within two minutes.
+- A tier that runs for hours survives the terminal that started it: `lab eval` treats a dropped connection like Ctrl-C, saving its checkpoint and handing chat back, and resumes with `--resume`.
 - While a benchmark or `lab serve` has the GPU, the homepage shows the chat as paused and names the model. The report is best effort and never slows a benchmark: the site probes the model's health itself.
 - Published data names files, never paths on `ai`: `lab publish` refuses a bundle that contains one.
 - Nothing public can write. The site's pages and its publishing API are separate listeners, and only the pages are reachable through Caddy.
@@ -70,7 +71,9 @@ pct reboot <ctid>
 
 On **ai** (as alex):
 ```sh
-sudo loginctl enable-linger alex          # user systemd units (lab-hosted) survive logout/reboot
+sudo loginctl enable-linger alex          # user systemd units (lab-hosted, lab-recover) survive logout/reboot
+cp lab/systemd/lab-recover.* ~/.config/systemd/user/ && systemctl --user daemon-reload
+systemctl --user enable --now lab-recover.timer   # chat comes back if a GPU job dies mid-run
 sudo tailscale set --operator=alex        # lets alex run `tailscale serve`
 echo 'export HF_HOME=/mnt/models/hf' >> ~/.bashrc
 # move the existing cache so nothing is re-downloaded:
