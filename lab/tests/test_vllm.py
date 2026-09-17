@@ -67,11 +67,21 @@ def test_server_argv_renders_every_knob_on_localhost_without_a_key(checkout, mon
     assert argv[-2:] == ["/bin/bash", str(checkout / "single-user/start_qwen.sh")]
     env = dict(a.split("=", 1) for a in argv[3:-2])
     assert env == {
+        "CUDA_HOME": str(paths.CUDA_HOME),
         "HOST": "127.0.0.1", "PORT": "8080", "MODEL": str(checkout / "models/fast"), "SPEC": "dflash2", "CTX": "fast",
         "MAX_LEN": "65536", "PREFIX_CACHE": "1", "KV_MEM": "5583457484", "MAX_SEQS": "8", "GPU_UTIL": "0.93",
         "DFLASH_TOKENS": "7", "LOOKUP": "1", "TOOLS": "1", "VISION": "0", "DRAFT": str(checkout / "models/draft"),
         "EXTRA_ARGS": "--served-model-name qwen3.8-27b-w4a16-autoround-fast/64k-dflash2 --load-format auto",
     }  # fmt: skip
+
+
+def test_the_launcher_is_told_the_real_toolkit_root(monkeypatch):
+    """flashinfer JIT-compiles at boot: without CUDA_HOME it follows `which nvcc` to /usr, which has no headers."""
+    monkeypatch.setattr(paths, "CUDA_HOME", Path("/opt/cuda-13"))
+    env = Vllm(root=Path("/q")).launch_env(_model(), _cfg(SHA), host="127.0.0.1", port=1, weights="w", draft=None)
+    assert env["CUDA_HOME"] == "/opt/cuda-13"
+    with pytest.raises(ValueError, match="may not set CUDA_HOME"):
+        Vllm(root=Path("/q")).launch_env(_model(), _cfg(SHA, env={"CUDA_HOME": "/usr"}), host="127.0.0.1", port=1, weights="w", draft=None)
 
 
 def test_prefix_cache_off_is_really_off():
@@ -100,7 +110,7 @@ def test_refuses_an_unpinned_checkout_or_a_key_file(checkout):
 
 def test_display_command_has_no_paths_and_passes_publish_checks():
     shown = Vllm(root=Path("/home/alex/qwen-serving")).display_command(_model(), _cfg(SHA))
-    assert shown.startswith("HOST=127.0.0.1 PORT=8080 MODEL=models/fast SPEC=dflash2 ")
+    assert shown.startswith(f"CUDA_HOME={paths.CUDA_HOME} HOST=127.0.0.1 PORT=8080 MODEL=models/fast SPEC=dflash2 ")
     assert shown.endswith(" single-user/start_qwen.sh") and "DRAFT=models/draft" in shown
     publish.check_no_local_paths({"cmd": shown})
     publish.check_no_secrets({"cmd": shown})

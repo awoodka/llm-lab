@@ -73,6 +73,7 @@ class Vllm:
         if bad := [a for a in extra if not a or any(c.isspace() for c in a)]:
             raise ValueError(f"the launcher splits EXTRA_ARGS on whitespace, so {bad!r} can't be passed")
         env = {
+            "CUDA_HOME": str(paths.CUDA_HOME),
             "HOST": host,
             "PORT": str(port),
             "MODEL": weights,

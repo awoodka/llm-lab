@@ -164,6 +164,11 @@ def _doctor_vllm(line, models: list[ModelSpec]) -> None:
         if c.params.draft:
             line((eng.root / c.params.draft).is_dir(), "vllm draft", f"{m.slug}/{c.slug}: {c.params.draft}")
     line(not (eng.root / "api_key.txt").exists(), "vllm api key", "none (the lab never sends one)")
+    # The first boot of a config JIT-compiles flashinfer kernels, so a toolkit the compiler can't use only
+    # shows up as a failed promote 20 minutes later.
+    header = paths.CUDA_HOME / "include/cuda_runtime.h"
+    line(header.is_file() and (paths.CUDA_HOME / "bin/nvcc").is_file(), "cuda toolkit",
+         f"{paths.CUDA_HOME}{'' if header.is_file() else ' — no include/cuda_runtime.h, flashinfer JIT would fail'}")
     memlock = subprocess.run(["systemctl", "--user", "show", hosted.UNIT, "-p", "LimitMEMLOCK", "--value"], capture_output=True, text=True).stdout.strip()
     events = dict(ln.split() for ln in Path("/sys/fs/cgroup/memory.events").read_text().splitlines())
     line(True, "memory", f"user-unit memlock {memlock or '?'} B; oom_kill events in this container: {events.get('oom_kill', '?')}")

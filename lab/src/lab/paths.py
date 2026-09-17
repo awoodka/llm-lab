@@ -24,6 +24,11 @@ MODELS = Path(os.environ.get("LAB_MODELS", _default_models_dir()))
 REFS = MODELS / "refs"
 DATASETS = MODELS / "datasets"
 
+# flashinfer JIT-compiles kernels on the first boot of a config and finds the toolkit through CUDA_HOME, or
+# else through `which nvcc`. /usr/bin/nvcc is a symlink and nvcc takes its root from the path it was called by,
+# so through that symlink the root is /usr and cuda_runtime.h goes missing: always hand the engine the real root.
+CUDA_HOME = Path(os.environ.get("LAB_CUDA_HOME", "/usr/local/cuda"))
+
 LLAMA_CPP = Path(os.environ.get("LAB_LLAMA_CPP", Path.home() / "llama.cpp"))
 # The syv-ai vLLM stack: a pinned clone with its own venv and models/. An upgrade is a new clone and a new symlink.
 QWEN_SERVING = Path(os.environ.get("LAB_QWEN_SERVING", Path.home() / "qwen-serving"))
