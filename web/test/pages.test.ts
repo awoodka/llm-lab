@@ -3,7 +3,7 @@ import { afterEach, beforeEach, test } from 'node:test';
 import { createPagesApp } from '../src/app.ts';
 import { openDb, type Db } from '../src/db.ts';
 import { ingest } from '../src/routes/api.ts';
-import { QWEN_GGUF_MODEL, VLLM_MODEL, bundle, chatBundle, evalsBundle, probe, qwenGgufChatBundle, vllmBundle } from './fixtures.ts';
+import { QWEN_GGUF_MODEL, VLLM_MODEL, assertNoLeaks, bundle, chatBundle, evalsBundle, probe, qwenGgufChatBundle, vllmBundle } from './fixtures.ts';
 
 const CHAT = 'https://chat.example.test';
 const MODEL = 'gemma-3-4b-it-q4_k_m-gguf';
@@ -95,12 +95,11 @@ test('unknown pages get the branded 404, and the pages app has no API at all', a
   }
 });
 
-test('public pages never show tailnet addresses or local paths', async () => {
+test('public pages never show tailnet addresses, local paths or emails', async () => {
   const app = createPagesApp(seeded(), probe('up'));
   for (const path of ['/', '/benchmarks', '/methodology', `/m/${MODEL}`, `/m/${MODEL}?c=default`, `/runs/${RUN}`, '/no-such-page']) {
     const { html } = await get(app, path);
-    assert.doesNotMatch(html, /ts\.net/, path);
-    assert.doesNotMatch(html, /(?<![\w.:/-])\/(home|mnt|srv|root)\//, path);
+    assertNoLeaks(html, path);
   }
 });
 
@@ -200,12 +199,11 @@ test('an evals run page lists its results', async () => {
   assert.match(html, /24\.0%/);
 });
 
-test('the capability pages never show tailnet addresses or local paths either', async () => {
+test('the capability pages never show tailnet addresses, local paths or emails either', async () => {
   const app = createPagesApp(scoredDb(), probe('up'));
   for (const path of ['/', '/benchmarks', '/benchmarks?view=speed', `/m/${MODEL}`, `/runs/${QUICK_RUN}`]) {
     const { html } = await get(app, path);
-    assert.doesNotMatch(html, /ts\.net/, path);
-    assert.doesNotMatch(html, /(?<![\w.:/-])\/(home|mnt|srv|root)\//, path);
+    assertNoLeaks(html, path);
   }
 });
 
@@ -319,13 +317,12 @@ test('the methodology explains the chat benchmark and credits its source', async
   assert.match(html, /250 W and holds its core clock at or below 1,625 MHz/);
 });
 
-test('chat-benchmark pages never show tailnet addresses or local paths', async () => {
+test('chat-benchmark pages never show tailnet addresses, local paths or emails', async () => {
   const app = createPagesApp(chatDb(), probe('up'));
   for (const path of ['/', '/benchmarks?view=speed&all=1', `/m/${VLLM_MODEL}`, `/m/${QWEN_GGUF_MODEL}`, '/runs/8b8b8b8b-1111-4222-8333-444444444444']) {
     const { status, html } = await get(app, path);
     assert.equal(status, 200, path);
-    assert.doesNotMatch(html, /ts\.net/, path);
-    assert.doesNotMatch(html, /(?<![\w.:/-])\/(home|mnt|srv|root)\//, path);
+    assertNoLeaks(html, path);
   }
 });
 

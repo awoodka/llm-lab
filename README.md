@@ -46,7 +46,7 @@ Guarantees:
 - GPU work refuses to start while the card's enforced power limit is above `LAB_MAX_POWER_W` (250 W by default).
 - A tier that runs for hours survives the terminal that started it: `lab eval` treats a dropped connection like Ctrl-C, saving its checkpoint and handing chat back, and resumes with `--resume`.
 - While a benchmark or `lab serve` has the GPU, the homepage shows the chat as paused and names the model. The report is best effort and never slows a benchmark: the site probes the model's health itself.
-- Published data names files, never paths on the GPU host: `lab publish` refuses a bundle that contains one.
+- Published data names files, never paths or tailnet addresses: `lab publish` refuses a bundle that contains one.
 - Nothing public can write. The site's pages and its publishing API are separate listeners, and only the pages are reachable through Caddy.
 
 ## How it's wired
@@ -231,8 +231,11 @@ chat off at once, delete its public hostname in Cloudflare or run `docker networ
 cd lab && uv run pytest
 cd web && npm test && npx tsc --noEmit
 INGEST_TOKEN=devtoken npm run dev          # pages on http://127.0.0.1:3000, publishing API on http://127.0.0.1:3100
+scripts/prepush-check.sh                   # before a push: private literals and GPQA text, across all of history
 ```
 To publish to a local dev site, set `web_url: http://127.0.0.1:3100` and `ingest_token: devtoken` in `lab/settings.yaml`.
+`lab/tests/test_repo_hygiene.py` fails if a tracked file names a tailnet host or address, an inbox or a host's disk;
+examples use `example-tailnet`, `100.64.0.1` and `example.com`.
 
 ## License
 

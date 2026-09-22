@@ -33,6 +33,17 @@ def check_no_local_paths(payload: dict) -> None:
         raise PublishError(f"bundle contains a local path ({excerpt!r}); publish file names only")
 
 
+# Addresses that only mean something on the lab's private network: tailnet names and Tailscale's range
+# (100.64.0.0/10). The site's pages are public, so a bundle naming one is refused rather than published.
+PRIVATE_ADDRESS_RE = re.compile(r"\b[A-Za-z0-9-]+\.ts\.net\b|\b100\.(?:6[4-9]|[7-9]\d|1[01]\d|12[0-7])\.\d{1,3}\.\d{1,3}\b")
+
+
+def check_no_private_addresses(payload: dict) -> None:
+    text = json.dumps(payload)
+    if m := PRIVATE_ADDRESS_RE.search(text):
+        raise PublishError(f"bundle names a private network address ({m.group()!r}); nothing public may point into the tailnet")
+
+
 # Credentials a launch command or env dict could carry. The ingest token is sent as a header, never in the bundle.
 SECRET_RE = re.compile(r"VLLM_API_KEY=\S|--api-key[= ]\S|Bearer\s+[\w.~+/-]{8,}|\bhf_[A-Za-z0-9]{20,}|\bsk-[A-Za-z0-9_-]{16,}")
 
@@ -76,6 +87,7 @@ def publish(rd: RunDir, dry_run: bool = False, replace: bool = False) -> dict:
     payload = bundle.model_dump(mode="json")
     payload["bundle_sha"] = bundle.content_sha()
     check_no_local_paths(payload)
+    check_no_private_addresses(payload)
     check_no_secrets(payload)
     if dry_run:
         return {"dry_run": True, "run_id": bundle.run.id, "metrics": len(bundle.metrics), "bytes": len(str(payload))}

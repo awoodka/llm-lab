@@ -3,7 +3,7 @@ import { before, test } from 'node:test';
 import { createApiApp, createPagesApp } from '../src/app.ts';
 import { openDb } from '../src/db.ts';
 import { getPause } from '../src/queries.ts';
-import { bundle, probe, TOKEN } from './fixtures.ts';
+import { assertNoLeaks, bundle, probe, TOKEN } from './fixtures.ts';
 
 const AUTH = { authorization: `Bearer ${TOKEN}`, 'content-type': 'application/json' };
 const JSON_ONLY = { 'content-type': 'application/json' };
@@ -58,5 +58,5 @@ test('the hosted model shows on the site, and an old lab chat_url is ignored', a
   assert.equal(put.status, 200);
   const html = await (await createPagesApp(db, probe('up')).request('/')).text();
   assert.match(html, /<strong>Online<\/strong> · <a href="\/m\/gemma-3-4b-it-q4_k_m-gguf\?c=default">Gemma 3 4B IT Q4_K_M · Default<\/a>/);
-  assert.doesNotMatch(html, /ts\.net/);
+  assertNoLeaks(html, '/');
 });

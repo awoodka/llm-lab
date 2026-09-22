@@ -1,3 +1,4 @@
+import assert from 'node:assert/strict';
 import { IngestBody } from '../src/contract.ts';
 import type { Probe, ProbeFn } from '../src/status.ts';
 
@@ -204,3 +205,14 @@ export function qwenGgufChatBundle(o: ChatOverrides = {}) {
 
 /** A model-health probe that always reports the same state. */
 export const probe = (value: Probe): ProbeFn => async () => value;
+
+/**
+ * Public pages name nothing private: no tailnet name or address (Tailscale's 100.64.0.0/10), no path on the lab's
+ * hosts, and no email address.
+ */
+export function assertNoLeaks(html: string, where: string): void {
+  assert.doesNotMatch(html, /ts\.net/, where);
+  assert.doesNotMatch(html, /\b100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\.\d{1,3}\.\d{1,3}\b/, where);
+  assert.doesNotMatch(html, /(?<![\w.:/-])\/(home|mnt|srv|root)\//, where);
+  assert.doesNotMatch(html, /[\w.+-]+@[\w-]+(\.[\w-]+)+/, where);
+}

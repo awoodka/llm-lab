@@ -143,3 +143,23 @@ def test_publish_allows_file_names_and_urls():
     publish.check_no_local_paths(
         {"cmd": "llama-server -m gemma-3-4b-it-Q4_K_M.gguf", "src": "https://huggingface.co/home/x", "repo": "ggml-org/gemma-3-4b-it-GGUF"}
     )
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"env": {"MODEL_HEALTH_URL": "https://ai.example-tailnet.ts.net:8443/health"}},
+        {"cmd": "curl --resolve ai:8443:100.64.0.1 https://ai:8443/v1/models"},
+        {"note": "served from 100.127" + ".255.254"},  # split, so the repo hygiene scan passes this file
+    ],
+)
+def test_publish_rejects_tailnet_addresses(payload):
+    with pytest.raises(publish.PublishError, match="private network address"):
+        publish.check_no_private_addresses(payload)
+
+
+def test_publish_allows_public_and_loopback_addresses():
+    publish.check_no_private_addresses(
+        {"cmd": "vllm serve --host 127.0.0.1 --port 18020", "dns": "1.1.1.1", "not_cgnat": ["100.63.0.1", "100.128.0.1"],
+         "site": "https://localinference.example.com", "version": "0.1.0+47747f3"}
+    )
