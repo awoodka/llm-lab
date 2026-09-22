@@ -1,0 +1,41 @@
+slug: 64k-dflash2-penalty6
+name: 64k ctx, DFlash2, think penalty 6 on Wait/Hmm/Alternatively
+notes: The hosted chat config's settings (64k context, bf16 KV cache, 8 request slots,
+  DFlash2), served from awoodka/qwen38-27b-rtx3090, the thinking-levers fork of syv-ai's
+  stack, at 4709063, with THINK_PENALTY=6. While the model is inside its thinking,
+  Wait, Hmm and Alternatively are 6 logits down, a near-ban; the answer after thinking
+  is untouched.
+params:
+  launcher: single-user/start_qwen.sh
+  launcher_commit: 4709063dbdb912c2b3932b13ee2a235d4d46a20c
+  ctx: 65536
+  spec: dflash2
+  ctx_profile: fast
+  prefix_cache: true
+  kv_mem: 5583457484
+  max_seqs: 8
+  gpu_util: 0.93
+  dflash_tokens: 7
+  lookup: true
+  tools: true
+  vision: false
+  draft: models/Qwen3.8-27B-DFlash2-W4A16
+  load_format: auto
+  env:
+    REASONING_EFFORT: ''
+    THINK_PENALTY: '6'
+    THINK_PENALTY_WORDS: Wait,Hmm,Alternatively
+  extra_args: []
+bench:
+  n_prompt: 512
+  n_gen: 128
+  depths:
+  - 0
+  - 4096
+  - 16384
+  reps: 5
+  delay_s: 3
+  http_prompt_lengths:
+  - 512
+  - 4096
+eval_overrides: {}
