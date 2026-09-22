@@ -1,7 +1,7 @@
-"""Push run bundles to the showcase site on `web`.
+"""Push run bundles to the showcase site on the web host.
 
 Settings come from env (LAB_WEB_URL, LAB_INGEST_TOKEN) or lab/settings.yaml:
-    web_url: https://web.example-tailnet.ts.net
+    web_url: https://web.example-tailnet.ts.net   # the site's publishing API, tailnet only
     ingest_token: <secret>
 """
 

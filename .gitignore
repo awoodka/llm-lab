@@ -11,3 +11,4 @@ web/backups/
 *.kld
 *.gguf
 .env
+web/deploy/local.env

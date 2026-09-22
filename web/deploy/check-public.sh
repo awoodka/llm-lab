@@ -1,25 +1,31 @@
 #!/usr/bin/env bash
-# Prove the public side of LLM Lab is safe. Run by deploy.sh, and every 10 minutes from alex's crontab on web:
-#   */10 * * * * /opt/llmlab/repo/deploy/check-public.sh --chat-only >> /opt/llmlab/logs/public-check.log 2>&1
+# Prove the public side of LLM Lab is safe. Run by deploy.sh, and every 10 minutes from the app user's crontab:
+#   */10 * * * * <app dir>/repo/deploy/check-public.sh --chat-only >> <app dir>/logs/public-check.log 2>&1
 #
-# chat.alexwoodka.com: unauthenticated requests, even with a forged Access header, must be redirected to Cloudflare
+# The chat (CHAT_HOST): unauthenticated requests, even with a forged Access header, must be redirected to Cloudflare
 #   Access. Any other answer (including a 5xx), seen twice in a row, means Open WebUI, which has no login, may be
 #   reachable, so it is disconnected from Caddy's network. A later run that sees Access working again reconnects it,
 #   but only if this script was the one that disconnected it. If public DNS says the hostname doesn't exist, the chat
 #   has been switched off, and that's ok.
-# localinference.alexwoodka.com, once Caddy routes it: /api must answer 404 and the homepage must not mention a
+# The site (SITE_HOST), once Caddy routes it: /api must answer 404 and the homepage must not mention a
 #   tailnet address. Otherwise the site is disconnected from Caddy's network (deploy.sh reattaches it).
-# Names are resolved with Cloudflare's DNS-over-HTTPS (1.1.1.1), so web's own resolver trouble can't skip a check.
-# Exit: 0 ok, 1 something was exposed (and cut off), 75 a check couldn't finish (lookup or network failure, site 5xx).
+# Names are resolved with Cloudflare's DNS-over-HTTPS (1.1.1.1), so the host's own resolver trouble can't skip a check.
+# The hostnames and the edge Caddyfile come from the app's .env (see env.example).
+# Exit: 0 ok, 1 something was exposed (and cut off), 75 a check couldn't finish (lookup or network failure, site 5xx,
+#   or a setting missing from .env).
 # Usage: check-public.sh [--chat-only] [--dry-run]    (--dry-run reports without disconnecting or reconnecting)
 set -Euo pipefail
 
-CHAT=chat.alexwoodka.com
-SITE=localinference.alexwoodka.com
+DEPLOY=$(cd "$(dirname "$0")" && pwd)
+. "$DEPLOY/env.sh"
+load_env "$ENV_FILE" SITE_HOST CHAT_HOST EDGE_CADDYFILE || exit 75
+
+CHAT=$CHAT_HOST
+SITE=$SITE_HOST
 DOH=${DOH:-https://1.1.1.1/dns-query}
 ACCESS_REDIRECT='^30[1237] https://[a-z0-9-]+\.cloudflareaccess\.com/'
 RETRY_AFTER_S=${RETRY_AFTER_S:-30}
-CUT_MARK=${CUT_MARK:-/opt/llmlab/logs/open-webui-cut-off}
+CUT_MARK=${CUT_MARK:-$APP_DIR/logs/open-webui-cut-off}
 
 chat_only=false
 dry_run=false
@@ -109,7 +115,7 @@ fi
 $chat_only && exit $status
 
 # -- site ---------------------------------------------------------------------------------------------------
-if ! grep -q '# >>> llmlab' /opt/edge/Caddyfile 2>/dev/null; then
+if ! grep -q '# >>> llmlab' "$EDGE_CADDYFILE" 2>/dev/null; then
   log "ok: $SITE is not routed by Caddy yet"
   exit $status
 fi

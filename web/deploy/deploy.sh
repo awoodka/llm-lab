@@ -2,19 +2,23 @@
 # Rebuild and restart the LLM Lab stack on `web` (site + Open WebUI), then prove exposure is exactly as intended:
 #   - the only port published on the host is 127.0.0.1:3000: the site's publishing API, for `tailscale serve`
 #   - the only llmlab containers on the public `edge` network are the site and Open WebUI, which Caddy proxies
-#   - chat.alexwoodka.com redirects unauthenticated requests to Cloudflare Access (check-public.sh)
-# Safe to re-run. Normally started by push.sh on ai.
+#   - the chat hostname redirects unauthenticated requests to Cloudflare Access (check-public.sh)
+# Safe to re-run. Normally started by push.sh on the GPU host. Settings and secrets: the app's .env (env.example).
 set -Eeuo pipefail
 
-L=/opt/llmlab
 DEPLOY=$(cd "$(dirname "$0")" && pwd)
+. "$DEPLOY/env.sh"
+L=$APP_DIR
 cd "$L"
 
-grep -qE '^INGEST_TOKEN=.{32,}$' .env || { echo "FAIL: INGEST_TOKEN is missing or short in $L/.env"; exit 1; }
-grep -qE '^WEBUI_SECRET_KEY=.{32,}$' .env || { echo "FAIL: WEBUI_SECRET_KEY is missing or short in $L/.env"; exit 1; }
-mkdir -p /opt/llmlab-data/site/backups /opt/llmlab-data/open-webui "$L/logs"
+grep -qE '^INGEST_TOKEN=.{32,}$' "$ENV_FILE" || { echo "FAIL: INGEST_TOKEN is missing or short in $ENV_FILE"; exit 1; }
+grep -qE '^WEBUI_SECRET_KEY=.{32,}$' "$ENV_FILE" || { echo "FAIL: WEBUI_SECRET_KEY is missing or short in $ENV_FILE"; exit 1; }
+load_env "$ENV_FILE" SITE_HOST CHAT_HOST AI_HOST AI_IP LLMLAB_DATA_DIR EDGE_CADDYFILE EDGE_CADDY_CONTAINER \
+  || { echo "FAIL: complete $ENV_FILE first (see deploy/env.example)"; exit 1; }
+D=$LLMLAB_DATA_DIR
+mkdir -p "$D/site/backups" "$D/open-webui" "$L/logs"
 
-compose() { docker compose --env-file "$L/.env" -f "$DEPLOY/compose.yml" "$@"; }
+compose() { docker compose --env-file "$ENV_FILE" -f "$DEPLOY/compose.yml" "$@"; }
 edge_members() { docker network inspect edge --format '{{range .Containers}}{{.Name}}{{"\n"}}{{end}}'; }
 
 # Back up the published data first. The image has node but no sqlite3 CLI.
@@ -22,14 +26,14 @@ if [ "$(docker inspect -f '{{.State.Running}}' llmlab-site-1 2>/dev/null)" = tru
   ts=$(date +%Y%m%d-%H%M%S)
   docker exec -e NODE_NO_WARNINGS=1 llmlab-site-1 node -e \
     "new (require('node:sqlite').DatabaseSync)('/data/lab.db').exec(\"VACUUM INTO '/data/backups/lab-$ts.db'\")"
-  ls -1t /opt/llmlab-data/site/backups/lab-*.db | tail -n +11 | xargs -r rm --
-  echo "backup: /opt/llmlab-data/site/backups/lab-$ts.db"
+  ls -1t "$D"/site/backups/lab-*.db | tail -n +11 | xargs -r rm --
+  echo "backup: $D/site/backups/lab-$ts.db"
 fi
 
 # Nothing gets attached to the public network unless this run proved the chat is behind Access. "Couldn't check"
 # (exit 75, e.g. Cloudflare unreachable from web) is not proof, so it stops the deploy too; try again later.
 if ! "$DEPLOY/check-public.sh" --chat-only; then
-  echo "FAIL: could not prove chat.alexwoodka.com is behind Cloudflare Access; not deploying"
+  echo "FAIL: could not prove $CHAT_HOST is behind Cloudflare Access; not deploying"
   exit 1
 fi
 

@@ -1,12 +1,12 @@
-# LLM Lab on `web`: the Local Inference site and its chat (Open WebUI).
+# LLM Lab on the web host: the Local Inference site and its chat (Open WebUI).
 #
 # Public, through Caddy on the shared `edge` network (Caddy → cloudflared; see Caddyfile.llmlab):
-#   https://localinference.alexwoodka.com → site, pages listener :3000 (alias llmlab-site)
-#   https://chat.alexwoodka.com           → open-webui :8080 (alias llmlab-open-webui), behind Cloudflare Access
+#   https://$SITE_HOST → site, pages listener :3000 (alias llmlab-site)
+#   https://$CHAT_HOST → open-webui :8080 (alias llmlab-open-webui), behind Cloudflare Access
 # Tailnet only: the site's publishing API (:3100) is published on 127.0.0.1:3000, which `tailscale serve` exposes as
-# https://web.example-tailnet.ts.net for `lab publish` on ai. Nothing else is published on the host.
+# https://web.<tailnet>.ts.net for `lab publish` on the GPU host. Nothing else is published on the host.
 # deploy.sh fails the deploy if exposure drifts; check-public.sh proves the chat is behind Access.
-# Secrets are interpolated from /opt/llmlab/.env (deploy.sh passes --env-file).
+# Hostnames, the data directory and the secrets come from the app's .env (deploy.sh passes --env-file; see env.example).
 name: llmlab
 
 x-logging: &logging
@@ -14,8 +14,8 @@ x-logging: &logging
   options: { max-size: "10m", max-file: "3" }
 
 x-ai-host: &ai-host
-  # web runs with Tailscale DNS off (a DNS watchdog keeps it off), so pin ai's tailnet name. TLS still verifies it.
-  - "ai.example-tailnet.ts.net:100.64.0.1"
+  # The web host may run with Tailscale DNS off, so pin the GPU host's tailnet name. TLS still verifies it.
+  - "${AI_HOST:?missing from .env}:${AI_IP:?missing from .env}"
 
 services:
   site:
@@ -30,13 +30,13 @@ services:
       PAGES_PORT: "3000"
       API_PORT: "3100"
       DB_PATH: /data/lab.db
-      PUBLIC_ORIGIN: https://localinference.alexwoodka.com
-      CHAT_URL: https://chat.alexwoodka.com
-      MODEL_HEALTH_URL: https://ai.example-tailnet.ts.net:8443/health   # live chat status on the homepage
-      INGEST_TOKEN: ${INGEST_TOKEN:?missing from /opt/llmlab/.env}
+      PUBLIC_ORIGIN: https://${SITE_HOST:?missing from .env}
+      CHAT_URL: https://${CHAT_HOST:?missing from .env}
+      MODEL_HEALTH_URL: https://${AI_HOST:?missing from .env}:8443/health   # live chat status on the homepage
+      INGEST_TOKEN: ${INGEST_TOKEN:?missing from .env}
     volumes:
-      - /opt/llmlab-data/site:/data
-    user: "1000:1000"   # alex, who owns /opt/llmlab-data
+      - ${LLMLAB_DATA_DIR:?missing from .env}/site:/data
+    user: "1000:1000"   # the deploying user, who owns LLMLAB_DATA_DIR
     read_only: true
     tmpfs:
       - /tmp:size=64m   # tsx's transform cache
@@ -59,18 +59,18 @@ services:
     restart: unless-stopped
     extra_hosts: *ai-host
     environment:
-      OPENAI_API_BASE_URL: https://ai.example-tailnet.ts.net:8443/v1
+      OPENAI_API_BASE_URL: https://${AI_HOST:?missing from .env}:8443/v1
       OPENAI_API_KEY: none   # llama-server and TabbyAPI on ai run without a key
       ENABLE_OLLAMA_API: "false"
-      # No login of its own: Cloudflare Access (you@example.com only) is the gate. WEBUI_AUTH can only be
+      # No login of its own: Cloudflare Access (an allow list of emails) is the gate. WEBUI_AUTH can only be
       # changed before the first account exists, so turning it on later means resetting Open WebUI's data.
       WEBUI_AUTH: "false"
       WEBUI_NAME: Local Inference   # Open WebUI shows it as "Local Inference (Open WebUI)"
-      WEBUI_URL: https://chat.alexwoodka.com
-      CORS_ALLOW_ORIGIN: https://chat.alexwoodka.com
+      WEBUI_URL: https://${CHAT_HOST:?missing from .env}
+      CORS_ALLOW_ORIGIN: https://${CHAT_HOST:?missing from .env}
       WEBUI_SESSION_COOKIE_SECURE: "true"
       ENABLE_API_KEYS: "false"
-      WEBUI_SECRET_KEY: ${WEBUI_SECRET_KEY:?missing from /opt/llmlab/.env}
+      WEBUI_SECRET_KEY: ${WEBUI_SECRET_KEY:?missing from .env}
       # Chat only: no retrieval, web search, image generation or code execution. Open WebUI still
       # fetches its small default embedding model (MiniLM) at startup; ~730 MiB RSS in total.
       BYPASS_EMBEDDING_AND_RETRIEVAL: "true"
@@ -84,7 +84,7 @@ services:
       DO_NOT_TRACK: "true"
       SCARF_NO_ANALYTICS: "true"
     volumes:
-      - /opt/llmlab-data/open-webui:/app/backend/data
+      - ${LLMLAB_DATA_DIR:?missing from .env}/open-webui:/app/backend/data
     security_opt: [no-new-privileges:true]
     mem_limit: 2g
     networks:

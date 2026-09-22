@@ -12,7 +12,7 @@ from dataclasses import dataclass, field
 import pynvml
 
 # Clock-event bits that mean real slowdown. SW power cap (0x04) is expected under the host's power cap
-# (the host's power-limit service on pve) and is tracked separately rather than flagging the run.
+# (set by a root service on the GPU's host) and is tracked separately rather than flagging the run.
 THROTTLE_BITS = 0x08 | 0x20 | 0x40 | 0x80  # HW slowdown, SW thermal, HW thermal, HW power brake
 POWER_CAP_BIT = 0x04
 
