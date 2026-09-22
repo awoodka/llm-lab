@@ -3,6 +3,7 @@ name = "lab"
 version = "0.1.0"
 description = "Local LLM performance lab CLI"
 readme = "README.md"
+license = "Apache-2.0"
 requires-python = ">=3.13"
 dependencies = [
     "httpx>=0.28.1",

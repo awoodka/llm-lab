@@ -1,3 +1,8 @@
+# Adapted from bfcl-eval 2026.3.23, the Berkeley Function Calling Leaderboard
+# (https://github.com/ShishirPatil/gorilla/tree/main/berkeley-function-call-leaderboard), Apache License 2.0:
+# grade_ast and grade_multi_turn follow bfcl_eval/eval_checker/eval_runner.py's _evaluate_single_ast_entry and
+# _evaluate_single_multi_turn_entry. Modified by Alex Woodka, 2026: condensed to return only the verdict and what
+# the lab records. The rest of this file is the lab's own, and calls bfcl-eval's handler and checkers unchanged.
 """BFCL (bfcl-eval 2026.3.23), run by its own handler and graded by its own checkers.
 
 Five categories: simple_python, multiple, parallel, parallel_multiple and multi_turn_base. The lab picks

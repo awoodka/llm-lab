@@ -1,0 +1,49 @@
+llm-lab
+Copyright 2026 Alex Woodka
+
+Licensed under the Apache License, Version 2.0 (see LICENSE).
+
+This repository includes material from other projects:
+
+- lab/src/lab/bench/data/prompts_real.jsonl: the eight chat prompts of the chat-c1-v1 benchmark, copied
+  unchanged from syv-ai/qwen38-27b-rtx3090 (https://github.com/syv-ai/qwen38-27b-rtx3090, since renamed
+  syv-ai/HyperQwen), bench/prompts_real.jsonl at commit bae2023ffc98753d337d2d2041784a277599a4c4, under the
+  Apache License 2.0. The benchmark protocol (lab/src/lab/bench/http_chat.py) is adapted from the same
+  repository's bench/run_benchmarks.sh.
+
+- lab/sandbox/bfcl/entry.py: its grading functions are adapted from bfcl-eval 2026.3.23, the Berkeley Function
+  Calling Leaderboard (https://github.com/ShishirPatil/gorilla), bfcl_eval/eval_checker/eval_runner.py, under
+  the Apache License 2.0.
+
+- lab/src/lab/evals/drivers/gpqa.py: its prompt is the multiple-choice template of openai/simple-evals
+  (https://github.com/openai/simple-evals), under the MIT License:
+
+    Copyright (c) 2024 OpenAI
+
+    Permission is hereby granted, free of charge, to any person obtaining a copy of this software and
+    associated documentation files (the "Software"), to deal in the Software without restriction, including
+    without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+    copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the
+    following conditions:
+
+    The above copyright notice and this permission notice shall be included in all copies or substantial
+    portions of the Software.
+
+    THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT
+    LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO
+    EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
+    IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR
+    THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+Used but not included here: these are fetched at build or run time, pinned, each under its own terms.
+
+- LiveCodeBench (https://github.com/LiveCodeBench/LiveCodeBench, MIT License, Copyright (c) 2024
+  LiveCodeBench): its code, at a pinned commit, runs in the LiveCodeBench sandbox image, with one release file
+  of the livecodebench/code_generation_lite dataset.
+- bfcl-eval 2026.3.23 (Apache License 2.0), installed into the BFCL sandbox image, with its bundled test data.
+- GPQA (Idavidrein/gpqa on Hugging Face, CC BY 4.0, gated). Its authors ask that the questions stay off the
+  web, so this repository holds its task ids only, and runs publish scores and task ids, never question text.
+- AIME 2025 (opencompass/AIME2025 on Hugging Face, MIT License).
+- Open WebUI (ghcr.io/open-webui/open-webui, Open WebUI License), run unmodified as the chat front end.
+- The engines and models the lab benchmarks: llama.cpp, vLLM through syv-ai/qwen38-27b-rtx3090 and its fork
+  awoodka/qwen38-27b-rtx3090, and model weights from Hugging Face, each under its own license.

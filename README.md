@@ -1,21 +1,22 @@
 # llm-lab
 
-Benchmark local LLMs on the `ai` container (RTX 3090) and publish the results to **Local Inference**, a public
-showcase site on the `web` container, with a private chat for the model `ai` hosts.
+Benchmark local LLMs on one GPU, score what they can actually do, and publish the results to a read-only showcase
+site. It runs **[Local Inference](https://localinference.alexwoodka.com)**: one RTX 3090, capped at 250 W, that also
+hosts a private chat, with every setting behind every number on the page.
 
-- **https://localinference.alexwoodka.com**: the homepage (intro, headline numbers, live chat status), the benchmarks
-  dashboard, model and run pages, and the methodology. Public, served by Caddy through the Cloudflare tunnel.
-- **https://chat.alexwoodka.com**: Open WebUI for the hosted model, behind Cloudflare Access (you@example.com only).
-- `lab/`: Python CLI (`lab`) that runs on `ai`. It manages the model/config catalog, benchmarks, the GPU lock, the hosted model and publishing.
-- `web/`: Node/TypeScript site (Hono + SQLite) that runs on `web`, plus its deploy files in `web/deploy/`.
+- `lab/`: a Python CLI (`lab`) for the GPU host. It keeps the model and config catalog, runs speed benchmarks and
+  capability evals, owns the GPU lock and the hosted chat model, and publishes runs.
+- `web/`: the site, Node/TypeScript (Hono + SQLite), for a separate web host, with its deploy scripts in
+  `web/deploy/`. It has two listeners: public pages, and a publishing API that only the tailnet can reach.
 
-A **model** is a base model plus a quant (Qwen 27B Q3_K_M and Q4_K_M are different models).
-A **config** is one set of runtime settings for a model (ctx, KV cache type, offload, and so on). You reference a config as `<model>/<config>`.
+A **model** is a base model plus a quant (Qwen 27B Q3_K_M and Q4_K_M are different models). A **config** is one set
+of runtime settings for a model (context, KV-cache type, offload, speculative decoding and so on), referenced as
+`<model>/<config>`. A **run** is one benchmark or eval sitting; it stays local until you publish it.
 
 ## Workflow
 
 ```sh
-cd ~/llm-lab/lab
+cd lab
 uv run lab doctor
 
 # register a GGUF (downloads to HF_HOME) and describe its base model in catalog/bases/<base>.yaml
@@ -28,12 +29,13 @@ uv run lab config show qwen3-30b-a3b-q4_k_m-gguf/32k-q8kv --cmd
 # tinker interactively (pauses the hosted model; Ctrl-C resumes it)
 uv run lab serve qwen3-30b-a3b-q4_k_m-gguf/32k-q8kv --host 0.0.0.0
 
-# benchmark → inspect → publish
+# benchmark and score → inspect → publish
 uv run lab bench qwen3-30b-a3b-q4_k_m-gguf/32k-q8kv
+uv run lab eval qwen3-30b-a3b-q4_k_m-gguf/32k-q8kv --tier quick
 uv run lab runs ls --unpublished
 uv run lab publish <run-dir-name-or-id>
 
-# host the winner (it becomes the model on chat.alexwoodka.com)
+# host the winner: it becomes the chat model
 uv run lab promote qwen3-30b-a3b-q4_k_m-gguf/32k-q8kv
 ```
 
@@ -41,87 +43,41 @@ Guarantees:
 - Every knob is rendered explicitly, including `--fit off`, `-np` and `--cache-ram`, so engine defaults never leak into results.
 - Configs are hash-locked: the site refuses a config slug that is republished with different settings.
 - GPU jobs take `state/gpu.lock`, stop the hosted model, wait for idle VRAM and a GPU below 45 °C, then restart the hosted model afterwards, even after a crash: `lab-recover.timer` puts chat back within two minutes.
+- GPU work refuses to start while the card's enforced power limit is above `LAB_MAX_POWER_W` (250 W by default).
 - A tier that runs for hours survives the terminal that started it: `lab eval` treats a dropped connection like Ctrl-C, saving its checkpoint and handing chat back, and resumes with `--resume`.
 - While a benchmark or `lab serve` has the GPU, the homepage shows the chat as paused and names the model. The report is best effort and never slows a benchmark: the site probes the model's health itself.
-- Published data names files, never paths on `ai`: `lab publish` refuses a bundle that contains one.
+- Published data names files, never paths on the GPU host: `lab publish` refuses a bundle that contains one.
 - Nothing public can write. The site's pages and its publishing API are separate listeners, and only the pages are reachable through Caddy.
 
 ## How it's wired
 
 ```
-visitor → Cloudflare (Access on chat.* only) → cloudflared → caddy on web's `edge` Docker network
-            localinference.alexwoodka.com → llmlab-site:3000        pages only
-            chat.alexwoodka.com           → llmlab-open-webui:8080  Caddy also requires the Access JWT header
-ai  → https://web.example-tailnet.ts.net (tailscale serve) → 127.0.0.1:3000 → site API listener (:3100)   lab publish / promote / pause
-web → https://ai.example-tailnet.ts.net:8443 → the hosted model's server on ai                                chat, status probe
+visitor → Cloudflare (Access on the chat hostname only) → cloudflared → Caddy on the web host's `edge` Docker network
+            SITE_HOST → llmlab-site:3000        pages only
+            CHAT_HOST → llmlab-open-webui:8080  Caddy also requires the Access JWT header
+GPU host → https://web.<tailnet>.ts.net (tailscale serve) → 127.0.0.1:3000 → site API listener (:3100)   lab publish / promote / pause
+web host → https://<gpu-host>.<tailnet>.ts.net:8443 (tailscale serve) → the hosted model's server       chat, status probe
 ```
 
-## One-time setup (needs you: sudo, the Proxmox host or a dashboard)
+The chat is [Open WebUI](https://github.com/open-webui/open-webui) with no login of its own: Cloudflare Access is the
+gate, Caddy refuses requests without Access's header, and `check-public.sh` cuts Open WebUI off from Caddy if the chat
+ever stops redirecting to Access. The tailnet is plumbing only; nothing public points into it.
 
-On the **pve host** (this wipes the NVMe, so first confirm nothing on it is needed with `lsblk -f`):
-```sh
-wipefs -a /dev/<disk>
-parted -s /dev/<disk> mklabel gpt mkpart models ext4 0% 100%
-mkfs.ext4 -m 0 -L models /dev/<disk>p1
-mkdir -p /mnt/nvme && echo 'LABEL=models /mnt/nvme ext4 defaults,noatime 0 2' >> /etc/fstab && mount /mnt/nvme
-mkdir -p /mnt/nvme/models && chown <host-uid>:<host-gid> /mnt/nvme/models   # alex (uid 1000) in unprivileged CT <ctid>
-pct set <ctid> -mp0 /mnt/nvme/models,mp=/mnt/models,backup=0
-pct reboot <ctid>
-```
+## Engines
 
-On **ai** (as alex):
-```sh
-sudo loginctl enable-linger alex          # user systemd units (lab-hosted, lab-recover) survive logout/reboot
-cp lab/systemd/lab-recover.* ~/.config/systemd/user/ && systemctl --user daemon-reload
-systemctl --user enable --now lab-recover.timer   # chat comes back if a GPU job dies mid-run
-sudo tailscale set --operator=alex        # lets alex run `tailscale serve`
-echo 'export HF_HOME=/mnt/models/hf' >> ~/.bashrc
-# move the existing cache so nothing is re-downloaded:
-mkdir -p /mnt/models/hf && mv ~/.cache/huggingface/hub /mnt/models/hf/
-# expose the hosted model to the tailnet (for the chat and the site's status probe on web):
-tailscale serve --bg --https=8443 http://127.0.0.1:8080
-```
-On ai itself the tailnet name resolves to 127.0.1.1 (`/etc/hosts`), so test the hosted model from another device or with
-`curl --resolve ai.example-tailnet.ts.net:8443:100.64.0.1 …`.
-
-In the **Tailscale policy file**:
-- An `ssh` rule accepting members into `tag:web` as `alex`/`root`, then `sudo tailscale set --ssh` on web.
-- `web` is tagged, so member grants don't cover its outgoing traffic. Add
-  `{"src": ["tag:web"], "dst": ["100.64.0.1"], "ip": ["tcp:8443"]}` for the chat and status probe → hosted model.
-  `ai → web:443` (publishing) is covered by the default member grant.
-
-On **web**:
-```sh
-mkdir -p /opt/llmlab && (umask 077; printf 'INGEST_TOKEN=%s\nWEBUI_SECRET_KEY=%s\n' \
-  "$(openssl rand -hex 32)" "$(openssl rand -hex 32)" > /opt/llmlab/.env)
-sudo tailscale serve --bg --https=443 http://127.0.0.1:3000   # the publishing API, tailnet only
-```
-Then put the same ingest token in `lab/settings.yaml` on ai (gitignored, mode 600):
-```yaml
-web_url: https://web.example-tailnet.ts.net
-ingest_token: "<INGEST_TOKEN from /opt/llmlab/.env on web>"
-```
-
-In **Cloudflare Zero Trust**, in this order, so the chat is never reachable without Access:
-1. Settings → Authentication: enable One-time PIN or Google.
-2. Access → Applications → Add → Self-hosted: hostname `chat.alexwoodka.com` (path empty), policy **Allow** →
-   Include → Emails → `you@example.com`, session duration 1 week, no Bypass, Service Auth or Everyone rules.
-3. Networks → Tunnels → the edge tunnel → Public hostnames: `localinference.alexwoodka.com` → `http://caddy:80`, and
-   `chat.alexwoodka.com` → `http://caddy:80` with **Protect with Access** enabled.
-
-## The vLLM engine (Qwen3.8 27B, speculative decoding)
-
-`llama.cpp` runs every GGUF. The second engine is a **pinned clone of
-[syv-ai/qwen38-27b-rtx3090](https://github.com/syv-ai/qwen38-27b-rtx3090)** — patched vLLM 0.28.0 with a W4A16
-AutoRound checkpoint and a DFlash2 draft model — which serves Qwen3.8 27B about five times faster than the Q4_K_M
-GGUF on the same card (146 t/s against 30.6 t/s of chat generation).
+`llama.cpp` runs every GGUF. The second engine is vLLM, through a **pinned clone of
+[syv-ai/qwen38-27b-rtx3090](https://github.com/syv-ai/qwen38-27b-rtx3090)**: patched vLLM 0.28.0 with a W4A16
+AutoRound checkpoint and a DFlash2 draft model, which serves Qwen3.8 27B about five times faster than the Q4_K_M
+GGUF on the same card (146 t/s against 30.6 t/s of chat generation). Its fork,
+**[awoodka/qwen38-27b-rtx3090](https://github.com/awoodka/qwen38-27b-rtx3090)**, adds opt-in levers that steer how
+Qwen3.8 spends its thinking, measured with this lab.
 
 ```
 ~/qwen-serving -> ~/qwen-serving-bae2023      the pin; an upgrade is a NEW clone, venv and config slug, then a symlink flip
-  venv/                                       its own uv venv (Python 3.12); `ai` itself stays free of torch
+  venv/                                       its own uv venv (Python 3.12); the GPU host itself stays free of torch
   single-user/start_qwen.sh                   the launcher; the lab sets every knob as an env var and never calls `vllm serve`
-  models/ -> /mnt/models/qwen-serving/models  the W4A16 weights and the DFlash2 draft
-~/qwen-serving-<sha7>                         another pinned commit's own clone and venv, e.g. the thinking-levers fork
+  models/ -> <models disk>/qwen-serving/models  the W4A16 weights and the DFlash2 draft
+~/qwen-serving-<sha7>                         another pinned commit's own clone and venv, e.g. the fork
 ```
 
 - A config pins `launcher_commit`. `lab doctor` checks the pin, the patch series, the weights, the draft and the CUDA
@@ -145,11 +101,11 @@ uv run lab promote qwen3.8-27b-w4a16-autoround-fast/64k-dflash2    # rolls back 
 
 Then set the default model in Open WebUI (Admin → Settings → Models) so new chats use it.
 
-**Rollback:** `lab promote qwen3.8-27b-q4_k_m-gguf/64k-q8kv` (about 20 s to boot) and reset Open WebUI's default
-model; for the stack itself, point `~/qwen-serving` back at the previous clone; `lab unpublish <run>` removes
-published numbers. The weights live in `/mnt/models/qwen-serving`.
+**Rollback:** `lab promote` the previous config (a llama.cpp config boots in about 20 s) and reset Open WebUI's
+default model; for the serving stack itself, point `~/qwen-serving` back at the previous clone; `lab unpublish <run>`
+removes published numbers.
 
-### Benchmarks: two methods, never mixed
+## Speed: two methods, never mixed
 
 - `lab bench <ref> --speed` is llama-bench: llama.cpp only, no chat template, short generations, and it sweeps context
   depth. It answers "how fast is this engine at depth N".
@@ -161,6 +117,30 @@ published numbers. The weights live in `/mnt/models/qwen-serving`.
 
 The same model measures ~33 t/s under llama-bench and ~30.6 t/s over HTTP; both are right, and the site keeps them in
 separate columns. Compare engines only through the HTTP method.
+
+## Capability evals
+
+```sh
+uv run lab eval <ref> --tier quick                                  # LiveCodeBench, BFCL, GPQA Diamond, AIME 2025
+uv run lab eval <ref> --tier quick --benchmarks aime_2025 --limit 2 # a smoke test; never publishable
+uv run lab eval <ref> --resume <run> --stop-at 07:30                # tiers can span several sittings
+```
+
+- Each config is scored exactly as it serves chat, thinking included, against its own server.
+- **A thinking allowance, not a stopwatch:** each task gets the tokens the config could generate in 5 minutes at its
+  own published speed, after reading the prompt. Thinking counts against it, and an answer that doesn't finish is
+  wrong, so speed buys reasoning. The allowance proxy (`lab/src/lab/evals/proxy.py`) is the only place request size
+  is set; it counts every prompt with the server's own tokenizer and checks each answer against the server's usage.
+- **Official harnesses where they exist:** LiveCodeBench and BFCL run their own published code for prompts and
+  grading, in no-network containers on the web host, and ask the lab for completions over a pipe. AIME and GPQA are
+  graded by the lab (the boxed integer; the last "Answer: X").
+- **Pinned subsets:** `lab/subsets/` holds the task ids each benchmark is pinned to, so every run answers the same
+  questions. GPQA's authors ask that its questions stay off the web: the repository holds its ids only, runs publish
+  scores and task ids, and the lab's reports print aggregates (`lab runs markers` refuses GPQA outright).
+- A tier is scored as one run; `lab publish` refuses partial tiers and `--limit` smoke tests.
+
+The site's [methodology page](https://localinference.alexwoodka.com/methodology) is the full account: the allowance
+formula, the coding-work score, the error bars, and what the numbers don't show.
 
 ### How a run spent its thinking
 
@@ -174,27 +154,76 @@ completion tokens, labelled), length stops, reflection-marker rates per 1,000 re
 share of reasoning after the answer first appears. With `--baseline` it adds task-paired deltas with bootstrap 95%
 intervals and the net count of newly failed attempts. `markers` lists the words the reasoning opens its sentences with,
 finished and cut-off attempts apart; it is where a marker penalty's word list comes from. Both print aggregates and task
-ids only, and `markers` refuses GPQA outright, since its questions must stay off the web.
+ids only, and `markers` refuses GPQA outright.
 
-## Deploying the site
+## Deploying your own
 
+You need a **GPU host** (Linux, an NVIDIA card, [uv](https://docs.astral.sh/uv/), a CUDA build of llama.cpp in
+`~/llama.cpp`) and a **web host** with Docker, both on one [Tailscale](https://tailscale.com) tailnet, plus a
+Cloudflare zone with a tunnel for the public side. The web host is expected to run a shared "edge": Caddy (with a
+healthcheck) and cloudflared on a Docker network named `edge`, and a Caddyfile that defines a `secheaders` snippet.
+
+On the **GPU host**, from a clone of this repository at `~/llm-lab` (the recovery unit expects it there):
 ```sh
-web/deploy/push.sh                                                      # from ai
-tailscale ssh alex@web /opt/llmlab/repo/deploy/apply-caddy.sh      # first time, or after editing Caddyfile.llmlab
+cd ~/llm-lab/lab && uv sync
+echo 'export HF_HOME=/path/to/a/big/disk/hf' >> ~/.bashrc     # models are large; LAB_MODELS moves the lab's own files
+sudo loginctl enable-linger "$USER"                           # user units (lab-hosted, lab-recover) survive logout
+mkdir -p ~/.config/systemd/user && cp systemd/lab-recover.* ~/.config/systemd/user/ && systemctl --user daemon-reload
+systemctl --user enable --now lab-recover.timer               # chat comes back if a GPU job dies mid-run
+sudo tailscale set --operator="$USER"                         # lets you run `tailscale serve`
+tailscale serve --bg --https=8443 http://127.0.0.1:8080       # the hosted model, for the chat and the status probe
+cp ../web/deploy/local.env.example ../web/deploy/local.env    # how push.sh reaches the web host; edit it
 ```
-- `push.sh` copies `web/` to `/opt/llmlab/repo` (the previous tree stays in `repo.prev`) and runs `deploy.sh`.
+Cap the GPU's power at boot on the machine that owns the card, as root (`nvidia-smi -pm 1 && nvidia-smi -pl 250`,
+for example from a oneshot unit), or set `LAB_MAX_POWER_W` to the limit you run: GPU work refuses to start above it.
+`lab promote` writes the hosted model's user unit. Then put the site's publishing address and token in
+`lab/settings.yaml` (gitignored, mode 600):
+```yaml
+web_url: https://web.<tailnet>.ts.net
+ingest_token: "<INGEST_TOKEN from the app's .env on the web host>"
+```
+
+On the **web host**, as the user who will deploy (uid 1000, which the site's container runs as), pick an app
+directory, say `/opt/llmlab`, and copy `web/deploy/env.example` to `/opt/llmlab/.env` (mode 600). Fill in every
+line: the two secrets (`openssl rand -hex 32` each), the public hostnames, the GPU host's tailnet name and address,
+a data directory that user owns, and the edge Caddy's details; `env.example` explains each. Then:
+```sh
+sudo tailscale serve --bg --https=443 http://127.0.0.1:3000     # the publishing API, tailnet only
+```
+If the web host is a tagged tailnet node, member grants don't cover its outgoing traffic: grant it `tcp:8443` to the
+GPU host.
+
+In **Cloudflare Zero Trust**, in this order, so the chat is never reachable without Access:
+1. Settings → Authentication: enable One-time PIN or an identity provider.
+2. Access → Applications → Add → Self-hosted, for `CHAT_HOST` with an empty path, and a policy that allows only your
+   own email. No Bypass, Service Auth or Everyone rules.
+3. The tunnel's public hostnames: `SITE_HOST` → `http://caddy:80`, and `CHAT_HOST` → `http://caddy:80` with
+   **Protect with Access** on.
+
+Then deploy from the GPU host:
+```sh
+web/deploy/push.sh                                            # copy web/ to <app dir>/repo there and run deploy.sh
+ssh -t <web host> <app dir>/repo/deploy/apply-caddy.sh        # first time, or after editing Caddyfile.llmlab
+```
+and add the watchdog to the web host's crontab:
+```
+*/10 * * * * <app dir>/repo/deploy/check-public.sh --chat-only >> <app dir>/logs/public-check.log 2>&1
+```
+
+- `push.sh` copies `web/` to `<app dir>/repo` on the web host (the previous tree stays in `repo.prev`) and runs `deploy.sh`.
 - `deploy.sh` backs up the SQLite database, refuses to attach Open WebUI to `edge` while the chat is published without
   Access, rebuilds, and stops the stack if anything but 127.0.0.1:3000 is published or any other llmlab container joins
   `edge`. It finishes with `check-public.sh`.
-- `check-public.sh` also runs every 10 minutes from alex's crontab on web (`--chat-only`). If the chat stops redirecting
-  to Cloudflare Access, it disconnects Open WebUI from Caddy; if the public site answers on `/api` or leaks a tailnet
-  address, it disconnects the site.
-- `apply-caddy.sh` validates the blocks in a throwaway Caddy, edits the shared `/opt/edge/Caddyfile` in place (it's a
-  single-file bind mount), restarts Caddy, checks the other sites and both hostnames, and restores the backup on any failure.
+- `check-public.sh` runs every 10 minutes with `--chat-only`. If the chat stops redirecting to Cloudflare Access, it
+  disconnects Open WebUI from Caddy; if the public site answers on `/api` or leaks a tailnet address, it disconnects
+  the site. `--dry-run` reports without changing anything.
+- `apply-caddy.sh` renders `Caddyfile.llmlab` from `.env`, validates it in a throwaway Caddy, edits the shared
+  Caddyfile in place (it's a single-file bind mount), restarts Caddy, checks the other sites and both hostnames, and
+  restores the backup on any failure. `--check` only compares what Caddy would run with what it runs now.
 
-Rollback: redeploy `repo.prev`; restore `/opt/edge/Caddyfile.bak-*` with `cat backup > /opt/edge/Caddyfile` and
-`docker restart edge-caddy-1`; database backups are in `/opt/llmlab-data/site/backups`. To switch the chat off at once,
-delete its public hostname in Cloudflare or run `docker network disconnect edge llmlab-open-webui-1` on web.
+Rollback: redeploy `repo.prev`; restore a Caddyfile backup (`$EDGE_CADDYFILE.bak-*`) with `cat backup > "$EDGE_CADDYFILE"`
+and `docker restart "$EDGE_CADDY_CONTAINER"`; database backups are in `$LLMLAB_DATA_DIR/site/backups`. To switch the
+chat off at once, delete its public hostname in Cloudflare or run `docker network disconnect edge llmlab-open-webui-1`.
 
 ## Development
 
@@ -204,3 +233,9 @@ cd web && npm test && npx tsc --noEmit
 INGEST_TOKEN=devtoken npm run dev          # pages on http://127.0.0.1:3000, publishing API on http://127.0.0.1:3100
 ```
 To publish to a local dev site, set `web_url: http://127.0.0.1:3100` and `ingest_token: devtoken` in `lab/settings.yaml`.
+
+## License
+
+Apache License 2.0 ([LICENSE](LICENSE)). [NOTICE](NOTICE) lists the material this repository adapts (the chat
+benchmark's prompts from syv-ai/qwen38-27b-rtx3090, BFCL's grading, the simple-evals GPQA prompt) and what it fetches
+at run time under its own terms (LiveCodeBench, bfcl-eval, the datasets, Open WebUI).
