@@ -13,6 +13,35 @@ A **model** is a base model plus a quant (Qwen 27B Q3_K_M and Q4_K_M are differe
 of runtime settings for a model (context, KV-cache type, offload, speculative decoding and so on), referenced as
 `<model>/<config>`. A **run** is one benchmark or eval sitting; it stays local until you publish it.
 
+## Current work: steering how Qwen3.8 thinks
+
+The hosted Qwen3.8 27B thinks at great length. In its published quick tier
+([run page](https://localinference.alexwoodka.com/runs/83638382-55b5-460b-a309-e80986a75c7d)), 73 answers ran out of
+their 5-minute allowance mid-thought and scored as wrong, while nearly every answer that finished was right. The
+[thinking-levers fork](https://github.com/awoodka/qwen38-27b-rtx3090) of the serving stack adds two opt-in ways to
+steer that thinking, and this lab measures them:
+
+- **A focused reasoning prompt:** a chat-template level that keeps the model's deepest setting but asks it to check
+  each step once and stop reopening settled work.
+- **A reflection-marker penalty:** a vLLM patch that pushes down words like "Wait" and "Hmm", only while the model is
+  thinking, and works under speculative decoding.
+
+The lab gained what the work needed: it keeps each answer's thinking and counts it (`lab runs thinking`,
+`lab runs markers`), and it runs a config from its own pinned checkout of the stack beside the hosted one.
+
+So far, from server-level tests rather than evals:
+- With both levers off, the fork runs upstream's exact command at upstream's speed, and neither lever slows decoding.
+- The penalty removes the words it targets at any strength, but only as an outright ban does it shorten the
+  thinking, by roughly a quarter on hard prompts, with fewer answers cut off. Milder settings just trade "Wait" for
+  "Actually" or "Maybe".
+- The focused prompt alone didn't change how long the model thinks.
+
+The evals are running now: a pilot on parts of AIME 2025 and LiveCodeBench, then the full benchmarks for whichever
+lever holds up. Each lever is judged against the fork with its levers off, on the same install and in the same week:
+the fork's speed runs came out a few percent faster than the baseline's, and since the allowance scales with speed,
+comparing against the old baseline alone would hand the levers extra room to think. Results will land here and in
+the fork's [docs/thinking-levers.md](https://github.com/awoodka/qwen38-27b-rtx3090/blob/thinking-levers/docs/thinking-levers.md).
+
 ## Workflow
 
 ```sh
@@ -70,7 +99,7 @@ ever stops redirecting to Access. The tailnet is plumbing only; nothing public p
 AutoRound checkpoint and a DFlash2 draft model, which serves Qwen3.8 27B about five times faster than the Q4_K_M
 GGUF on the same card (146 t/s against 30.6 t/s of chat generation). Its fork,
 **[awoodka/qwen38-27b-rtx3090](https://github.com/awoodka/qwen38-27b-rtx3090)**, adds opt-in levers that steer how
-Qwen3.8 spends its thinking, measured with this lab.
+Qwen3.8 spends its thinking, measured with this lab ([current work](#current-work-steering-how-qwen38-thinks)).
 
 ```
 ~/qwen-serving -> ~/qwen-serving-bae2023      the pin; an upgrade is a NEW clone, venv and config slug, then a symlink flip
