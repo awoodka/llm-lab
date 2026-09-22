@@ -220,7 +220,7 @@ def _scrape(base: str) -> dict[str, float]:
 
 def run_http(ref: str, *, wait: bool, keep_paused: bool, cli_args: str) -> RunDir:
     model, cfg = catalog.load_config(ref)
-    engine = get_engine(model.engine)
+    engine = get_engine(model.engine, cfg)
     prompts = load_prompts()
     served_id = f"{model.slug}/{cfg.slug}"
     argv = engine.server_argv(model, cfg, host="127.0.0.1", port=PORT)

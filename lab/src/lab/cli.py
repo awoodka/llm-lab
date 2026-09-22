@@ -141,29 +141,33 @@ def doctor() -> None:
 
 def _doctor_vllm(line, models: list[ModelSpec]) -> None:
     from lab.catalog import VllmParams
-    from lab.engines.vllm import Vllm
+    from lab.engines.vllm import Vllm, checkout_for
 
-    eng = Vllm()
-    try:
-        b = eng.build_info()
-    except Exception as e:  # noqa: BLE001
-        line(False, "vllm", f"{eng.root}: {e}")
-        return
-    x = b.extra
     configs = [(m, c) for m in models for c in catalog.list_configs(m.slug) if isinstance(c.params, VllmParams)]
-    pins = {c.params.launcher_commit for _, c in configs}
-    head = x.get("launcher_commit") or ""
-    line(bool(b.version) and head in pins and not x["dirty"] and not x["patches_missing"], "vllm",
-         f"{b.version} at {head[:9]} ({'pinned' if head in pins else 'NOT the pinned ' + ', '.join(p[:9] for p in pins)}), "
-         f"{x['patches_applied']} patches{', missing ' + ', '.join(x['patches_missing']) if x['patches_missing'] else ''}"
-         f"{', DIRTY tree' if x['dirty'] else ''}; torch {x.get('torch')}")
+    pins = sorted({c.params.launcher_commit for _, c in configs})
+    # Each pinned commit runs from its own checkout (checkout_for): the hosted stack's, and any per-commit one.
+    for pin in pins or [""]:
+        eng = Vllm(root=checkout_for(pin) if pin else None)
+        try:
+            b = eng.build_info()
+        except Exception as e:  # noqa: BLE001
+            line(False, "vllm", f"{eng.root}: {e}")
+            continue
+        x = b.extra
+        head = x.get("launcher_commit") or ""
+        pinned = bool(pin) and head == pin
+        line(bool(b.version) and pinned and not x["dirty"] and not x["patches_missing"], "vllm",
+             f"{eng.root.name}: {b.version} at {head[:9]} ({'pinned' if pinned else 'NOT the pinned ' + (pin[:9] or 'commit')}) "
+             f"from {x['launcher_repo']}, {x['patches_applied']} patches"
+             f"{', missing ' + ', '.join(x['patches_missing']) if x['patches_missing'] else ''}"
+             f"{', DIRTY tree' if x['dirty'] else ''}; torch {x.get('torch')}")
+        for m, c in configs:
+            if c.params.launcher_commit == pin and c.params.draft:
+                line((eng.root / c.params.draft).is_dir(), "vllm draft", f"{m.slug}/{c.slug}: {eng.root.name}/{c.params.draft}")
+        line(not (eng.root / "api_key.txt").exists(), "vllm api key", f"{eng.root.name}: none (the lab never sends one)")
     for m in models:
         weights = catalog.resolve_model_path(m)
         line(weights.is_dir(), "vllm weights", f"{m.slug}: {weights}")
-    for m, c in configs:
-        if c.params.draft:
-            line((eng.root / c.params.draft).is_dir(), "vllm draft", f"{m.slug}/{c.slug}: {c.params.draft}")
-    line(not (eng.root / "api_key.txt").exists(), "vllm api key", "none (the lab never sends one)")
     # The first boot of a config JIT-compiles flashinfer kernels, so a toolkit the compiler can't use only
     # shows up as a failed promote 20 minutes later.
     header = paths.CUDA_HOME / "include/cuda_runtime.h"
@@ -250,7 +254,7 @@ def config_new(
 @config_app.command("show")
 def config_show(ref: str, cmd: bool = typer.Option(False, "--cmd", help="Only print the launch command")) -> None:
     model, cfg = catalog.load_config(ref)
-    engine = get_engine(model.engine)
+    engine = get_engine(model.engine, cfg)
     if not cmd:
         typer.echo(yaml.safe_dump(cfg.model_dump(mode="json", exclude_none=True), sort_keys=False))
         typer.echo(f"config_hash: {catalog.config_hash(model, cfg)}")
@@ -267,7 +271,7 @@ def serve(
 ) -> None:
     """Run a config interactively in the foreground (pauses the hosted model; Ctrl-C resumes it)."""
     model, cfg = catalog.load_config(ref)
-    argv = get_engine(model.engine).server_argv(model, cfg, host=host, port=port)
+    argv = get_engine(model.engine, cfg).server_argv(model, cfg, host=host, port=port)
     typer.echo(shlex.join(argv))
     _check_power()
     from lab.engines.process import ServerProcess
@@ -537,7 +541,7 @@ def _rollback_promote(ref: str, previous: dict[Path, str]) -> None:
 def promote(ref: str) -> None:
     """Make a config the always-on hosted model. If it never becomes healthy, the previous one comes back."""
     model, cfg = catalog.load_config(ref)
-    engine = get_engine(model.engine)
+    engine = get_engine(model.engine, cfg)
     argv = engine.server_argv(model, cfg, host="127.0.0.1", port=HOSTED_PORT)
     _check_power()
     previous = {p: p.read_text() for p in (paths.HOSTED_SH, paths.HOSTED_JSON) if p.is_file()}

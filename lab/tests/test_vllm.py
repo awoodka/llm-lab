@@ -272,3 +272,78 @@ def test_serving_several_requests_at_once_relaunches_only_the_engine_that_needs_
 def test_more_requests_than_the_config_serves_is_refused(tmp_path):
     with pytest.raises(ValueError, match="max_seqs"):
         _dialect(tmp_path, max_seqs=8).eval_launch(_cfg(SHA, max_seqs=8), 16)
+
+
+def _second_checkout(tmp_path: Path, like: Path) -> tuple[Path, str]:
+    """Another launcher repo at its own commit, named the way checkout_for finds it: qwen-serving-<sha7>."""
+    staging = tmp_path / "staging"
+    subprocess.run(["cp", "-a", str(like), str(staging)], check=True)
+    (staging / "single-user/start_qwen.sh").write_text("#!/bin/bash\n# the fork's launcher\n")
+    _git(staging, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qam", "fork")
+    sha = _git(staging, "rev-parse", "HEAD")
+    named = like.parent / f"qwen-serving-{sha[:7]}"
+    staging.rename(named)
+    return named, sha
+
+
+def test_a_config_runs_from_its_own_commits_checkout(checkout, tmp_path, monkeypatch):
+    from lab.engines.vllm import checkout_for
+
+    monkeypatch.setattr(paths, "QWEN_SERVING", checkout)
+    monkeypatch.setattr(paths, "QWEN_SERVING_FROM_ENV", False)
+    hosted_sha = _git(checkout, "rev-parse", "HEAD")
+    assert checkout_for(hosted_sha) == checkout, "no qwen-serving-<sha7>: the default checkout"
+    assert checkout_for(None) == checkout and checkout_for("") == checkout
+    named, sha = _second_checkout(tmp_path, checkout)
+    assert checkout_for(sha) == named
+    monkeypatch.setattr(paths, "QWEN_SERVING_FROM_ENV", True)
+    assert checkout_for(sha) == checkout, "LAB_QWEN_SERVING pins one checkout for everything"
+
+
+def test_the_hosted_stack_keeps_its_own_paths(tmp_path, checkout, monkeypatch):
+    """~/qwen-serving is a symlink to ~/qwen-serving-<sha7>: the config at that commit still launches through the
+    symlink, so the hosted command line stays byte for byte what it was."""
+    from lab.engines.vllm import checkout_for
+
+    sha = _git(checkout, "rev-parse", "HEAD")
+    real = checkout.parent / f"qwen-serving-{sha[:7]}"
+    checkout.rename(real)
+    link = tmp_path / "qwen-serving"
+    link.symlink_to(real)
+    monkeypatch.setattr(paths, "QWEN_SERVING", link)
+    monkeypatch.setattr(paths, "QWEN_SERVING_FROM_ENV", False)
+    assert checkout_for(sha) == link
+    argv = get_engine("vllm", _cfg(sha)).server_argv(_model(), _cfg(sha), host="127.0.0.1", port=8080)
+    assert argv[-1] == str(link / "single-user/start_qwen.sh")
+
+
+def test_get_engine_launches_a_pinned_commit_from_its_checkout(checkout, tmp_path, monkeypatch):
+    monkeypatch.setattr(paths, "QWEN_SERVING", checkout)
+    monkeypatch.setattr(paths, "QWEN_SERVING_FROM_ENV", False)
+    named, sha = _second_checkout(tmp_path, checkout)
+    argv = get_engine("vllm", _cfg(sha)).server_argv(_model(), _cfg(sha), host="127.0.0.1", port=8080)
+    env = dict(a.split("=", 1) for a in argv[3:-2])
+    assert argv[-1] == str(named / "single-user/start_qwen.sh")
+    assert env["DRAFT"] == str(named / "models/draft"), "the drafter comes from the launching checkout"
+    assert env["MODEL"] == str(checkout / "models/fast"), "weights are the model's, wherever it launches from"
+    hosted = get_engine("vllm", _cfg(_git(checkout, "rev-parse", "HEAD")))
+    assert hosted.root == checkout
+    with pytest.raises(CheckoutMismatch, match=f"qwen-serving-{'f' * 7}"):
+        get_engine("vllm", _cfg("f" * 40)).check_checkout(_cfg("f" * 40).params)
+
+
+@pytest.mark.parametrize(("url", "repo"), [
+    ("https://github.com/someone/qwen38-27b-rtx3090", "someone/qwen38-27b-rtx3090"),
+    ("git@github.com:someone/qwen38-27b-rtx3090.git", "someone/qwen38-27b-rtx3090"),
+    ("https://github.com/syv-ai/qwen38-27b-rtx3090.git", "syv-ai/qwen38-27b-rtx3090"),
+    (None, "syv-ai/qwen38-27b-rtx3090"),
+])
+def test_build_info_records_the_repo_the_checkout_came_from(checkout, url, repo):
+    if url:
+        _git(checkout, "remote", "add", "origin", url)
+    assert Vllm(root=checkout).build_info().extra["launcher_repo"] == repo
+
+
+def test_the_hosted_configs_identity_is_unchanged():
+    """New launcher knobs reach a config only through params.env, so no existing config hash moves."""
+    assert catalog.config_hash(*catalog.load_config(REF)) == "fe91aca6edc81062fb2d45bf5285ad6e57f83df75020cddc1b16805615d6bb76"

@@ -32,3 +32,6 @@ CUDA_HOME = Path(os.environ.get("LAB_CUDA_HOME", "/usr/local/cuda"))
 LLAMA_CPP = Path(os.environ.get("LAB_LLAMA_CPP", Path.home() / "llama.cpp"))
 # The syv-ai vLLM stack: a pinned clone with its own venv and models/. An upgrade is a new clone and a new symlink.
 QWEN_SERVING = Path(os.environ.get("LAB_QWEN_SERVING", Path.home() / "qwen-serving"))
+#: With LAB_QWEN_SERVING set, that one checkout serves every config. Otherwise a config whose pinned commit has
+#: its own ~/qwen-serving-<sha7> checkout runs from there (lab.engines.vllm.checkout_for).
+QWEN_SERVING_FROM_ENV = "LAB_QWEN_SERVING" in os.environ

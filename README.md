@@ -121,10 +121,15 @@ GGUF on the same card (146 t/s against 30.6 t/s of chat generation).
   venv/                                       its own uv venv (Python 3.12); `ai` itself stays free of torch
   single-user/start_qwen.sh                   the launcher; the lab sets every knob as an env var and never calls `vllm serve`
   models/ -> /mnt/models/qwen-serving/models  the W4A16 weights and the DFlash2 draft
+~/qwen-serving-<sha7>                         another pinned commit's own clone and venv, e.g. the thinking-levers fork
 ```
 
 - A config pins `launcher_commit`. `lab doctor` checks the pin, the patch series, the weights, the draft and the CUDA
   toolkit; a checkout that has drifted, or that grew an `api_key.txt`, refuses to start.
+- The pin also picks the checkout: `~/qwen-serving-<sha7>` when it exists and isn't what `~/qwen-serving` already
+  points at, else `~/qwen-serving`, so the hosted config's command line never changes. `LAB_QWEN_SERVING` pins one
+  checkout for everything. A run records its checkout's GitHub origin as `launcher_repo`, so a fork's runs say so,
+  and `lab doctor` checks every pinned checkout.
 - The launcher binds `0.0.0.0` by default, so the lab always passes `HOST`. It never sends an API key.
 - `CUDA_HOME` is part of the launch environment: flashinfer JIT-compiles kernels on a config's first boot, and through
   the `/usr/bin/nvcc` symlink it would look for CUDA headers in `/usr` and fail. Override with `LAB_CUDA_HOME`.

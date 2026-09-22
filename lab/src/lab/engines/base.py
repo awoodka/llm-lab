@@ -92,15 +92,18 @@ class Engine(Protocol):
         ...
 
 
-def get_engine(name: str) -> Engine:
+def get_engine(name: str, cfg: ConfigSpec | None = None) -> Engine:
+    """The engine a model runs on. For vLLM, pass the config: it launches from the checkout its pinned
+    commit resolves to (lab.engines.vllm.checkout_for)."""
     if name == "llama.cpp":
         from lab.engines.llamacpp import LlamaCpp
 
         return LlamaCpp()
     if name == "vllm":
-        from lab.engines.vllm import Vllm
+        from lab.engines.vllm import Vllm, checkout_for
 
-        return Vllm()
+        commit = getattr(cfg.params, "launcher_commit", None) if cfg is not None else None
+        return Vllm(root=checkout_for(commit) if commit else None)
     raise NotImplementedError(f"engine {name!r} is not implemented yet")
 
 

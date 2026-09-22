@@ -173,6 +173,23 @@ class VllmDialect:
         return cfg, {"parallel": parallel} if parallel > 1 else {}
 
 
+def checkout_for(commit: str | None) -> Path:
+    """The launcher checkout a config's pinned commit runs from.
+
+    ~/qwen-serving-<commit[:7]> when that directory exists and is not what ~/qwen-serving already points at,
+    so the hosted stack keeps its ~/qwen-serving paths and its command line; otherwise ~/qwen-serving. With
+    LAB_QWEN_SERVING set, that checkout serves everything. check_checkout still verifies the full SHA, so a
+    wrong directory fails loudly instead of launching other code.
+    """
+    base = paths.QWEN_SERVING
+    if paths.QWEN_SERVING_FROM_ENV or not commit:
+        return base
+    named = base.parent / f"{base.name}-{commit[:7]}"
+    if named.is_dir() and not (base.exists() and named.resolve() == base.resolve()):
+        return named
+    return base
+
+
 class Vllm:
     name = "vllm"
     boot_timeout_s = 1500
@@ -189,8 +206,9 @@ class Vllm:
         head = self._git("rev-parse", "HEAD")
         if head != p.launcher_commit:
             raise CheckoutMismatch(
-                f"{self.root} is at {head[:12] or 'no commit'}, but the config pins {p.launcher_commit[:12]}; "
-                "an upgraded stack needs a new config slug"
+                f"{self.root} is at {head[:12] or 'no commit'}, but the config pins {p.launcher_commit[:12]}: "
+                f"no {self.root.parent / (paths.QWEN_SERVING.name + '-' + p.launcher_commit[:7])} checkout at that "
+                "commit (it would be picked automatically), and an upgraded stack needs a new config slug"
             )
         if (self.root / "api_key.txt").exists():
             raise CheckoutMismatch(f"{self.root / 'api_key.txt'} exists: the launcher would require that key, which the lab never sends")
@@ -305,13 +323,18 @@ class Vllm:
         missing = [n for n, ok in status.items() if not ok]
         return len(series) - len(missing), missing
 
+    def launcher_repo(self) -> str:
+        """owner/name of the checkout's GitHub origin, so a run from a fork records the fork."""
+        m = re.search(r"github\.com[:/]([^/\s]+/[^/\s]+?)(?:\.git)?/?$", self._git("remote", "get-url", "origin"))
+        return m.group(1) if m else "syv-ai/qwen38-27b-rtx3090"
+
     def build_info(self) -> EngineBuild:
         python = self.root / "venv/bin/python"
         out = subprocess.run([str(python), "-c", VERSIONS_PY], capture_output=True, text=True)
         versions = json.loads(out.stdout) if out.returncode == 0 else {}
         applied, missing = self.patch_status()
         extra: dict = {
-            "launcher_repo": "syv-ai/qwen38-27b-rtx3090",
+            "launcher_repo": self.launcher_repo(),
             "launcher_commit": self._git("rev-parse", "HEAD") or None,
             "dirty": bool(self._git("status", "--porcelain", "--untracked-files=no")),
             "patch_series_sha256": hashlib.sha256((self.root / "patches/series").read_bytes()).hexdigest(),

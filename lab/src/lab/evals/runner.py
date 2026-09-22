@@ -280,7 +280,7 @@ def run_evals(
     images: dict[str, Image] = {b.key: get_driver(b.key).image() for b in benches if getattr(get_driver(b.key), "sandboxed", False)}
 
     rd, bundle, resumed = _open_run(ref, model, cfg, tier, cli_args, resume)
-    engine = get_engine(model.engine)
+    engine = get_engine(model.engine, cfg)
     _hold_run_to_its_start(rd, bundle, engine, benches, allowance, images, resumed)
     ctx = _ctx(rd, bundle, time.monotonic())
     dialect = engine.dialect(model, cfg)
@@ -420,7 +420,7 @@ def _open_run(ref: str, model: ModelSpec, cfg: ConfigSpec, tier: str, cli_args: 
             raise EvalError(f"{rd.path.name} is already published; start a new run instead")
         return rd, bundle, True
     weights = catalog.resolve_model_path(model)
-    ctx = start_run(model, cfg, "evals", get_engine(model.engine), weights, cli_args, tier=tier)
+    ctx = start_run(model, cfg, "evals", get_engine(model.engine, cfg), weights, cli_args, tier=tier)
     return ctx.rd, ctx.bundle, False
 
 
