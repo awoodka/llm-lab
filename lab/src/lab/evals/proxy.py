@@ -56,8 +56,12 @@ class TaskStats:
     budget_s: float = 0.0
     #: The latest prompt's size: the server still holds it, so the next request's prefix is cached.
     last_prompt_tokens: int = 0
+    #: Thinking tokens, summed over the requests whose usage reported them (reasoning_requests of them).
+    reasoning_tokens: int = 0
+    reasoning_requests: int = 0
 
-    def add(self, *, prompt: int, completion: int, allowance: int, finish: str | None, seconds: float, error: bool, cost_s: float = 0.0) -> None:
+    def add(self, *, prompt: int, completion: int, allowance: int, finish: str | None, seconds: float, error: bool,
+            cost_s: float = 0.0, reasoning: int | None = None) -> None:
         self.requests += 1
         self.prompt_tokens += prompt
         self.completion_tokens += completion
@@ -66,8 +70,16 @@ class TaskStats:
         self.errors += error
         self.seconds += seconds
         self.budget_s += cost_s
+        if reasoning is not None:
+            self.reasoning_tokens += reasoning
+            self.reasoning_requests += 1
         if not error:
             self.last_prompt_tokens = prompt
+
+    @property
+    def reasoning_reported(self) -> bool:
+        """Every request of the task came back with the server's thinking-token count."""
+        return self.requests > 0 and self.reasoning_requests == self.requests
 
 
 @dataclass
@@ -207,6 +219,7 @@ class AllowanceProxy:
                 finish=entry.get("finish_reason"),
                 seconds=entry.get("seconds") or 0.0,
                 error=bool(entry.get("error")),
+                reasoning=entry.get("reasoning_tokens"),
             )
             if self._log:
                 self._log.write(json.dumps(entry) + "\n")
@@ -335,6 +348,7 @@ def _make_handler(proxy: AllowanceProxy) -> type[BaseHTTPRequestHandler]:
             entry.update(
                 server_prompt_tokens=usage.get("prompt_tokens"),
                 completion_tokens=usage.get("completion_tokens", 0),
+                reasoning_tokens=(usage.get("completion_tokens_details") or {}).get("reasoning_tokens"),
                 finish_reason=(data.get("choices") or [{}])[0].get("finish_reason"),
                 cached_tokens=(usage.get("prompt_tokens_details") or {}).get("cached_tokens"),
                 predicted_per_second=timings.get("predicted_per_second"),
@@ -375,6 +389,7 @@ def _make_handler(proxy: AllowanceProxy) -> type[BaseHTTPRequestHandler]:
                 cached_tokens=(usage.get("prompt_tokens_details") or {}).get("cached_tokens"),
                 server_prompt_tokens=usage.get("prompt_tokens"),
                 completion_tokens=usage.get("completion_tokens", 0),
+                reasoning_tokens=(usage.get("completion_tokens_details") or {}).get("reasoning_tokens"),
                 finish_reason=finish,
                 seconds=round(time.monotonic() - started, 3),
                 stream=True,

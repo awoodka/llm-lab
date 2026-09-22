@@ -68,6 +68,28 @@ def test_operating_numbers_are_per_task_and_keyed_by_benchmark():
     assert "eval_allowance_tokens" not in {m.key for m in metrics(AIME, attempts, quick=False)}
 
 
+def test_thinking_tokens_are_published_only_when_every_counted_attempt_has_them():
+    counted_all = [attempt("t1", 1, True, reasoning_tokens=300), attempt("t1", 2, False, reasoning_tokens=900),
+                   attempt("t2", 1, True, reasoning_tokens=100)]
+    by_key = {m.key: m for m in metrics(AIME, counted_all, quick=True)}
+    assert by_key["eval_reasoning_tokens_per_task"].value == 650.0, "1300 over 2 tasks"
+    one_missing = counted_all[:2] + [attempt("t2", 1, True)]
+    assert "eval_reasoning_tokens_per_task" not in {m.key for m in metrics(AIME, one_missing, quick=True)}, \
+        "a mean over some attempts would read as the whole"
+
+
+def test_a_checkpoint_from_before_thinking_tokens_were_recorded_still_resumes(tmp_path):
+    path = tmp_path / "attempts.jsonl"
+    old = {"benchmark": "aime_2025", "task": "t1", "attempt": 1, "passed": True, "extracted": "70", "seconds": 4.0,
+           "prompt_tokens": 90, "completion_tokens": 1200, "allowance": 8000, "finish_reason": "stop",
+           "error": None, "excluded": False, "detail": {}}
+    path.write_text(json.dumps(old) + "\n")
+    resumed = Checkpoint(path)
+    assert resumed.has("aime_2025", "t1", 1)
+    assert resumed.attempts[("aime_2025", "t1", 1)].reasoning_tokens is None
+    resumed.close()
+
+
 def test_a_checkpoint_survives_a_stopped_sitting(tmp_path):
     path = tmp_path / "attempts.jsonl"
     first = Checkpoint(path)

@@ -157,6 +157,20 @@ published numbers. The weights live in `/mnt/models/qwen-serving`.
 The same model measures ~33 t/s under llama-bench and ~30.6 t/s over HTTP; both are right, and the site keeps them in
 separate columns. Compare engines only through the HTTP method.
 
+### How a run spent its thinking
+
+```sh
+uv run lab runs thinking <run> [<run>...] [--baseline <run>] [--format table|markdown|csv]
+uv run lab runs markers <run> --benchmarks livecodebench,bfcl
+```
+
+`thinking` gives, per benchmark: accuracy ± SE, reasoning tokens (the server's count where the run kept it, else the
+completion tokens, labelled), length stops, reflection-marker rates per 1,000 reasoning words, tok/s, and for AIME the
+share of reasoning after the answer first appears. With `--baseline` it adds task-paired deltas with bootstrap 95%
+intervals and the net count of newly failed attempts. `markers` lists the words the reasoning opens its sentences with,
+finished and cut-off attempts apart; it is where a marker penalty's word list comes from. Both print aggregates and task
+ids only, and `markers` refuses GPQA outright, since its questions must stay off the web.
+
 ## Deploying the site
 
 ```sh

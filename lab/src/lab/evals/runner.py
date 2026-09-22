@@ -108,7 +108,8 @@ class EvalSession:
         """One request through the proxy, graded, plus the reply it was graded on.
 
         Infrastructure failures are retried, then excluded. Only `content` is graded: a model's thinking
-        (`reasoning_content`) is kept for the transcript but never read for an answer.
+        (`reasoning_content` from llama.cpp, `reasoning` from vLLM) is kept for the transcript but never
+        read for an answer.
         """
         if bench.key in self.boxes:
             return self.answer_in_box(bench, task, attempt, self.boxes[bench.key])
@@ -143,13 +144,14 @@ class EvalSession:
             record.detail = outcome.detail
             record.prompt_tokens = usage.get("prompt_tokens") or 0
             record.completion_tokens = usage.get("completion_tokens") or 0
+            record.reasoning_tokens = (usage.get("completion_tokens_details") or {}).get("reasoning_tokens")
             record.finish_reason = choice.get("finish_reason")
             # The size the proxy enforced, not a recomputation from the server's count.
             record.allowance = int(r.headers.get("x-lab-allowance") or self.proxy.allowance.for_prompt(record.prompt_tokens))
             # An answer that ran out of allowance is unfinished, which the benchmark scores as wrong.
             if record.finish_reason == "length":
                 record.passed = False
-            reply = {k: message[k] for k in ("reasoning_content", "content", "tool_calls") if message.get(k)}
+            reply = {k: message[k] for k in ("reasoning_content", "reasoning", "content", "tool_calls") if message.get(k)}
             return record, reply
         raise AssertionError("unreachable")
 
@@ -197,6 +199,7 @@ class EvalSession:
             record.detail = result.get("detail") or {}
             record.prompt_tokens = stats.prompt_tokens
             record.completion_tokens = stats.completion_tokens
+            record.reasoning_tokens = stats.reasoning_tokens if stats.reasoning_reported else None
             record.allowance = stats.allowance_tokens // stats.requests if stats.requests else 0
             record.finish_reason = "length" if stats.length_stops else "stop"
             record.passed = bool(result.get("passed")) and not stats.length_stops
@@ -490,6 +493,7 @@ def _transcript_writer(rd: RunDir):
                 "messages": task.messages, "reply": reply, "expected": task.answer,
                 "extracted": record.extracted, "passed": record.passed,
                 "finish_reason": record.finish_reason, "completion_tokens": record.completion_tokens,
+                "reasoning_tokens": record.reasoning_tokens,
             }) + "\n")
 
     return write

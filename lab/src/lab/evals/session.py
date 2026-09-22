@@ -35,6 +35,9 @@ class Attempt:
     error: str | None = None
     excluded: bool = False
     detail: dict[str, Any] = field(default_factory=dict)
+    #: The server's count of thinking tokens in the answer (usage.completion_tokens_details), or None when it
+    #: reports none; a checkpoint written before this field existed loads with None.
+    reasoning_tokens: int | None = None
 
     @property
     def key(self) -> tuple[str, str, int]:
@@ -135,6 +138,10 @@ def metrics(bench: Benchmark, attempts: list[Attempt], *, quick: bool) -> list[M
         out.append(
             Metric(key="eval_allowance_tokens", method=bench.key, value=round(statistics.fmean(a.allowance for a in used), 1), unit="tokens")
         )
+    # Only when every counted attempt has the server's count: a mean over some of them would read as the whole.
+    if used and all(a.reasoning_tokens is not None for a in used):
+        out.append(Metric(key="eval_reasoning_tokens_per_task", method=bench.key,
+                          value=round(sum(a.reasoning_tokens or 0 for a in used) / n, 1), unit="tokens", n=len(tasks)))
     return out
 
 

@@ -104,8 +104,10 @@ class FakeServer:
                 completion, finish = (12, "stop") if asked > 100 else (asked, "length")
                 if body.get("stream"):
                     return self._stream(prompt, completion, finish)
-                # Thinking arrives apart from the answer, as llama-server sends it with a reasoning format.
-                message = {"role": "assistant", "reasoning_content": "maybe \\boxed{70}", "content": "\\boxed{12}"}
+                # Thinking arrives apart from the answer: llama-server calls it reasoning_content, vLLM
+                # calls it reasoning and also counts its tokens in usage.
+                thinking = "reasoning" if proxy_self.engine == "vllm" else "reasoning_content"
+                message = {"role": "assistant", thinking: "maybe \\boxed{70}", "content": "\\boxed{12}"}
                 answer = {
                     "id": "chatcmpl-1", "model": "fake",
                     "choices": [{"index": 0, "message": message, "finish_reason": finish}],
@@ -118,6 +120,7 @@ class FakeServer:
                     proxy_self.salts_seen.add(salt)
                     answer.pop("timings")
                     answer["usage"]["prompt_tokens_details"] = {"cached_tokens": cached}
+                    answer["usage"]["completion_tokens_details"] = {"reasoning_tokens": 7}
                 return self._json(200, answer)
 
             def _stream(self, prompt, completion, finish):
@@ -126,9 +129,12 @@ class FakeServer:
                 self.send_header("connection", "close")
                 self.end_headers()
                 self.close_connection = True
+                usage = {"prompt_tokens": prompt, "completion_tokens": completion}
+                if proxy_self.engine == "vllm":
+                    usage["completion_tokens_details"] = {"reasoning_tokens": 7}
                 for piece in ({"choices": [{"delta": {"content": "ok"}}]},
                               {"choices": [{"delta": {}, "finish_reason": finish}]},
-                              {"choices": [], "usage": {"prompt_tokens": prompt, "completion_tokens": completion}}):
+                              {"choices": [], "usage": usage}):
                     self.wfile.write(f"data: {json.dumps(piece)}\n\n".encode())
                 self.wfile.write(b"data: [DONE]\n\n")
                 self.wfile.flush()
@@ -240,7 +246,7 @@ def test_tools_count_toward_the_prompt(proxy, upstream):
     assert upstream.seen[-1]["tools"], "tools still reach the model"
 
 
-def test_streaming_relays_the_chunks_and_still_records_usage(proxy):
+def test_streaming_relays_the_chunks_and_still_records_usage(proxy, upstream):
     with httpx.stream(
         "POST", f"{proxy.base_url}/chat/completions",
         json={"model": "m", "messages": [{"role": "user", "content": "hi"}], "stream": True},
@@ -252,6 +258,10 @@ def test_streaming_relays_the_chunks_and_still_records_usage(proxy):
     assert proxy.count_mismatches == 0
     stats = proxy.stats.for_task("lcb:7")
     assert stats.requests == 1 and stats.completion_tokens == 12 and stats.length_stops == 0
+    if upstream.engine == "vllm":
+        assert stats.reasoning_tokens == 7 and stats.reasoning_reported, "vLLM's count survives streaming"
+    else:
+        assert stats.reasoning_tokens == 0 and not stats.reasoning_reported, "no count, and it says so"
 
 
 def test_an_upstream_failure_is_reported_and_recorded(proxy, upstream):
@@ -295,7 +305,9 @@ def test_the_runner_keeps_the_reply_it_graded_and_the_allowance_it_was_given(pro
     task = Task(id="aime_2025/I-1", messages=[{"role": "user", "content": " ".join(["word"] * 100)}], answer="70")
     record, reply = session.answer(BY_KEY["aime_2025"], task, 1)
 
-    assert reply == {"reasoning_content": "maybe \\boxed{70}", "content": "\\boxed{12}"}, "the transcript holds both"
+    thinking = "reasoning" if upstream.engine == "vllm" else "reasoning_content"
+    assert reply == {thinking: "maybe \\boxed{70}", "content": "\\boxed{12}"}, "the transcript holds both, as each engine names them"
+    assert record.reasoning_tokens == (7 if upstream.engine == "vllm" else None), "the server's count, or none"
     assert (record.extracted, record.passed) == ("12", False), "only the answer is graded, never the thinking"
     assert record.prompt_tokens == 101
     assert record.allowance == upstream.seen[-1]["max_tokens"], "the size that was enforced, not a recomputation"
@@ -367,6 +379,7 @@ def test_a_boxed_task_is_graded_by_its_harness_and_costed_by_the_proxy(proxy, up
     assert record.passed and record.extracted == "f(x=1)" and not record.excluded
     assert record.detail == {"category": "multi_turn_base", "requests": 2}
     assert record.prompt_tokens == 100 + 150 and record.completion_tokens == 24, "summed over the task's requests"
+    assert record.reasoning_tokens == (14 if upstream.engine == "vllm" else None), "summed, and only when every request had it"
     assert record.allowance == sum(b["max_tokens"] for b in upstream.seen) // 2
     assert all(b["model"] == "gemma/32k" for b in upstream.seen), "the lab names the model, not the harness"
     assert len(reply["transcript"]) == 2

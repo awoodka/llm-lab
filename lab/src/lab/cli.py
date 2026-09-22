@@ -410,6 +410,55 @@ def runs_show(ref: str) -> None:
     _print_run(store.find_run(ref))
 
 
+@runs_app.command("thinking")
+def runs_thinking(
+    refs: list[str],
+    baseline: str | None = typer.Option(None, help="A run to pair the others with, task by task"),
+    fmt: str = typer.Option("table", "--format", help="table, markdown or csv"),
+    benchmarks: str | None = typer.Option(None, help="Comma-separated benchmark keys (default: all)"),
+    words: str = typer.Option("Wait,Hmm,Alternatively,Actually,Maybe", help="Marker words to count in reasoning"),
+) -> None:
+    """How eval runs spent their thinking, per benchmark: accuracy, reasoning tokens, length stops, marker rates.
+
+    With --baseline, paired deltas with bootstrap 95% intervals over tasks. Aggregates and task ids only,
+    never message text.
+    """
+    from lab.evals import efficiency
+
+    if fmt not in ("table", "markdown", "csv"):
+        _fail("--format is table, markdown or csv")
+    word_list = tuple(w for w in words.split(",") if w)
+    runs = {}
+    for ref in refs:
+        rd = store.find_run(ref)
+        runs[rd.path.name[:15]] = efficiency.load_rows(rd.path, word_list)
+    base = None
+    if baseline:
+        brd = store.find_run(baseline)
+        base = (brd.path.name[:15], efficiency.load_rows(brd.path, word_list))
+        runs.pop(base[0], None)
+    records = efficiency.thinking_report(runs, base, word_list, benchmarks.split(",") if benchmarks else None)
+    typer.echo(efficiency.render(records, word_list, fmt), nl=False)
+
+
+@runs_app.command("markers")
+def runs_markers(
+    ref: str,
+    benchmarks: str | None = typer.Option(None, help="Comma-separated benchmark keys (default: all but GPQA)"),
+    top: int = typer.Option(30, help="How many sentence-opening words to list"),
+) -> None:
+    """The words a run's reasoning opens its sentences with, per 1,000 words, finished and cut-off attempts apart.
+
+    THINK_PENALTY_WORDS are chosen from this. GPQA is refused: none of its text leaves the machine.
+    """
+    from lab.evals import efficiency
+
+    try:
+        typer.echo(efficiency.markers_report(store.find_run(ref).path, benchmarks.split(",") if benchmarks else None, top), nl=False)
+    except ValueError as e:
+        _fail(str(e))
+
+
 # -- publish -----------------------------------------------------------------
 @app.command()
 def publish(
