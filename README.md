@@ -242,3 +242,7 @@ examples use `example-tailnet`, `100.64.0.1` and `example.com`.
 Apache License 2.0 ([LICENSE](LICENSE)). [NOTICE](NOTICE) lists the material this repository adapts (the chat
 benchmark's prompts from syv-ai/qwen38-27b-rtx3090, BFCL's grading, the simple-evals GPQA prompt) and what it fetches
 at run time under its own terms (LiveCodeBench, bfcl-eval, the datasets, Open WebUI).
+
+The history was rewritten once, when the repository went public, to take one homelab's private details out of it;
+[docs/history-rewrite.md](docs/history-rewrite.md) maps the old commit ids, which runs published before then record
+as their lab version, to the new ones.
