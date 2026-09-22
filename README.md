@@ -181,6 +181,7 @@ for example from a oneshot unit), or set `LAB_MAX_POWER_W` to the limit you run:
 ```yaml
 web_url: https://web.<tailnet>.ts.net
 ingest_token: "<INGEST_TOKEN from the app's .env on the web host>"
+sandbox_host: you@web     # LiveCodeBench and BFCL run their containers here, over ssh (BatchMode): key or Tailscale SSH
 ```
 
 On the **web host**, as the user who will deploy (uid 1000, which the site's container runs as), pick an app
@@ -231,7 +232,7 @@ chat off at once, delete its public hostname in Cloudflare or run `docker networ
 cd lab && uv run pytest
 cd web && npm test && npx tsc --noEmit
 INGEST_TOKEN=devtoken npm run dev          # pages on http://127.0.0.1:3000, publishing API on http://127.0.0.1:3100
-scripts/prepush-check.sh                   # before a push: private literals and GPQA text, across all of history
+scripts/prepush-check.sh                   # before a push: your private literals and GPQA fragments (~/.config/llm-lab) in all history
 ```
 To publish to a local dev site, set `web_url: http://127.0.0.1:3100` and `ingest_token: devtoken` in `lab/settings.yaml`.
 `lab/tests/test_repo_hygiene.py` fails if a tracked file names a tailnet host or address, an inbox or a host's disk;
